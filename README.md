@@ -1,0 +1,92 @@
+# tg-insight
+
+Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
+
+## Behavior
+
+- A Telethon user session discovers its joined group chats; sources can be fixed in
+  configuration or selected through the private bot.
+- Messages are stored in a local SQLite database with FTS5 trigram search.
+- A separate Telegram bot exposes `/ask`, `/summary`, `/settings`, `/checkin`, `/status`, and `/help`.
+- Daily summaries are sent only to `TG_SUMMARY_TARGET`, at the configured UTC+8
+  (Asia/Shanghai) time.
+- Daily summaries rank cross-group, high-information developments first, then give
+  a separate intelligence update for every group with archived activity.
+- `/content` classifies the recent text of selected groups. Adult groups identified
+  automatically or marked manually are excluded from daily and on-demand summaries,
+  while their messages remain archived.
+- `LLM_FALLBACK_MODEL` can provide a backup model for temporary primary-model
+  connection, timeout, rate-limit, or server failures.
+- `/checkin` sends configurable plain-text daily check-ins through the authorized
+  personal Telegram account. Each target has its own UTC+8 schedule, message, and
+  on/off switch. New targets default to 00:30, then send after a persisted random
+  300-800ms delay. A successful manual or scheduled check-in is recorded for the
+  day, and failed scheduled sends retry at most three times.
+- LLM prompts treat all Telegram content as untrusted data and cannot perform Telegram actions.
+- Archive size, free disk reserve, digest input, and automatic retries have hard limits.
+
+## Setup
+
+1. Copy `.env.example` to `.env` and fill every required value.
+2. Create the persistent directory with owner `10001:10001`.
+3. Build the image.
+4. Authorize the Telegram user session once.
+5. Start the service, then choose archive sources through `/groups`; the picker supports
+   pages, selecting or clearing a whole page, and a final completion button.
+
+```bash
+mkdir -p data
+chown 10001:10001 data
+docker compose build
+docker compose run --rm tg-insight auth
+docker compose up -d
+```
+
+Start a private chat with the configured bot before expecting a scheduled digest.
+Only IDs in `TG_ALLOWED_USER_IDS` can use the bot.
+
+## Commands
+
+```text
+/groups           Page through joined groups and select or clear a whole page
+/recent [1-50]    Choose any joined group and read its most recent text messages
+/ask <question>   Search archived group history and answer with sources
+/summary          Generate the last 24-hour digest immediately
+/settings         Set daily push time or turn scheduled pushes on or off
+/content          Classify groups; reanalyze a page or every selected group
+/checkin          Add a group, configure daily check-in text/time, toggle, or run now
+/status           Show archive size, source chats, schedule, and model
+/help             Show command help
+```
+
+Plain text sent privately to the bot is treated as an `/ask` query. Group selection,
+recent-message reads, archive queries, and summaries are restricted to configured
+numeric user IDs and are available only in a private bot chat.
+
+Check-in target selection is intentionally separate from archive-source selection:
+the target can be a joined Telegram group or a Bot that appears in the authorized
+account's dialog list. Set the exact text required by the target, for example
+`@example_bot /checkin` in a group or `/checkin` in a Bot chat, through the Bot's
+`/checkin` menu. The text is sent directly by the authorized Telegram user account
+and is never sent to the configured LLM provider.
+
+## Resource limits
+
+The production defaults retain up to two years, up to 10 million messages, and at
+most 10 GiB of SQLite archive data while preserving at least 1 GiB of free disk
+space. A digest uses at most 500 messages and 120,000 serialized characters. Failed
+scheduled digests retry at most three times with exponential backoff. Adjust these
+values conservatively for the host capacity.
+
+## Security
+
+The Telethon session file grants access to the Telegram account. Keep `data/` and
+`.env` root-owned or otherwise tightly restricted on the host. Prefer a dedicated
+Telegram account that is a member only of required groups. Chat records are sent to
+the configured LLM provider for summarization and Q&A; use a provider and retention
+policy acceptable for the group. Custom LLM endpoints must use HTTPS.
+
+The runtime image uses a pinned base digest and hash-locked Linux/Python 3.12
+dependencies. Regenerate and review both lock files before changing dependency
+versions. `.dockerignore` excludes the environment file, sessions, and archive from
+the Docker build context.

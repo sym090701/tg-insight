@@ -1,0 +1,29 @@
+services:
+  tg-insight:
+    build: .
+    image: tg-insight:0.1.16
+    container_name: tg-insight
+    command: ["run"]
+    restart: unless-stopped
+    init: true
+    user: "10001:10001"
+    read_only: true
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data:rw
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m,uid=10001,gid=10001
+      - /home/app:rw,noexec,nosuid,size=8m,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.75
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
