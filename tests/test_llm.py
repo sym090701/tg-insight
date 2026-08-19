@@ -3,9 +3,12 @@ import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
+
 from tg_insight.database import StoredMessage
 from tg_insight.llm import (
     Answer,
+    EventDecision,
     InsightLLM,
     _batch_messages,
     _content_category,
@@ -72,6 +75,50 @@ def test_content_category_parser_fails_closed_to_uncertain() -> None:
     assert _content_category('```json\n{"category":"general"}\n```') == "general"
     assert _content_category('{"category":"unexpected"}') == "uncertain"
     assert _content_category("not json") == "uncertain"
+
+
+class EventLLMStub(InsightLLM):
+    def __init__(self, content: str) -> None:
+        self.content = content
+        self.calls: list[list[dict[str, str]]] = []
+
+    async def _complete(self, messages, temperature):
+        self.calls.append(messages)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=self.content))])
+
+
+@pytest.mark.asyncio
+async def test_event_detection_requires_a_structured_high_priority_decision() -> None:
+    stub = EventLLMStub(
+        '{"alert":true,"priority":"high","reason":"官方确认服务中断",'
+        '"topic":"服务中断","new_information":"已确认影响支付且正在抢修",'
+        '"is_update":false}'
+    )
+    cutoff = dt.datetime(2026, 8, 19, 0, 0, tzinfo=dt.timezone.utc)
+
+    decision = await stub.detect_event(
+        "群组", "支付服务已中断", [sample()], cutoff - dt.timedelta(minutes=2), cutoff
+    )
+
+    assert decision == EventDecision(
+        True, "high", "官方确认服务中断", "服务中断", "已确认影响支付且正在抢修", False
+    )
+    prompt = stub.calls[0][0]["content"]
+    records = stub.calls[0][1]["content"]
+    assert "never alert merely because it contains a keyword" in prompt
+    assert "is_update" in prompt
+    assert "Target message time: 2026-08-18T23:58:00+00:00" in records
+    assert "Recent same-group context" in records
+
+
+@pytest.mark.asyncio
+async def test_event_detection_fails_closed_for_incomplete_or_invalid_results() -> None:
+    stub = EventLLMStub('{"alert":true,"priority":"medium","reason":"可能有事"}')
+    now = dt.datetime(2026, 8, 19, tzinfo=dt.timezone.utc)
+
+    decision = await stub.detect_event("群组", "可能有重要通知", [], now, now)
+
+    assert decision == EventDecision(False)
 
 
 class FallbackCompletions:

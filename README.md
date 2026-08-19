@@ -34,7 +34,10 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
 - When an archived group contains a likely human-initiated check-in request, the
   private management Bot asks for approval. Only the explicit “同意并部署” button
   creates the default 00:30 automatic check-in; “忽略” does nothing.
-- `/alerts` enables keyword and AI-assisted major-event alerts. `/backup` creates
+- `/alerts` enables major-event alerts. Keywords are only candidate signals: AI
+  verifies the target message against its timestamp and recent same-group context,
+  ignores stale forwards and ordinary discussion, and suppresses repeated topics
+  unless a later message contains a material update. `/backup` creates
   a consistent SQLite backup and sends it to the authorized user; the seven newest
   backups are retained. The backup contains archived chat history, so treat it as
   sensitive data.

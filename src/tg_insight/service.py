@@ -15,7 +15,13 @@ from telethon import Button, TelegramClient, events, functions, types
 
 from .config import Settings
 from .database import Archive, StoredMessage
-from .llm import CONTENT_CATEGORIES, InsightLLM, limit_summary_messages, render_answer
+from .llm import (
+    CONTENT_CATEGORIES,
+    EventDecision,
+    InsightLLM,
+    limit_summary_messages,
+    render_answer,
+)
 
 log = logging.getLogger("tg_insight")
 
@@ -59,6 +65,9 @@ ALERT_EVENT_HINTS = (
     "维护", "漏洞", "攻击", "泄露", "发布", "报名", "活动", "规则更新", "breaking",
 )
 ALERT_KEYWORDS_DEFAULT = "紧急,重要通知,故障,截止,封禁,下架,涨价,维护,漏洞,攻击,泄露,发布,报名"
+ALERT_CONTEXT_MESSAGES = 12
+ALERT_MAX_MESSAGE_AGE = dt.timedelta(minutes=45)
+ALERT_TOPIC_COOLDOWN = dt.timedelta(minutes=15)
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,12 @@ class SourceChat:
     name: str
     username: str | None
     target_kind: str = "group"
+
+
+@dataclass(frozen=True)
+class AlertRecord:
+    sent_at: dt.datetime
+    new_information: str
 
 
 @dataclass(frozen=True)
@@ -138,7 +153,8 @@ class TelegramInsightService:
         self._checkin_waiters: dict[tuple[int, str], asyncio.Future[tuple[str, str]]] = {}
         self._refresh_lock = asyncio.Lock()
         self._alert_tasks: set[asyncio.Task[None]] = set()
-        self._alert_last_sent: dict[int, dt.datetime] = {}
+        self._alert_last_sent: dict[tuple[int, str], AlertRecord] = {}
+        self._alert_lock = asyncio.Lock()
         self._checkin_suggestion_days: set[tuple[int, str]] = set()
         self._user_id: int | None = None
 
@@ -334,12 +350,12 @@ class TelegramInsightService:
         self.bot.add_event_handler(self._on_private_text, events.NewMessage(incoming=True))
 
     async def _on_new_message(self, event: Any) -> None:
-        await self._observe_checkin_message(event)
-        await self._suggest_checkin_from_message(event)
-        await self._schedule_alert_analysis(event)
         source = self.sources.get(event.chat_id)
         if source is not None:
             await self._store_telegram_message(source, event.message)
+        await self._observe_checkin_message(event)
+        await self._suggest_checkin_from_message(event)
+        await self._schedule_alert_analysis(event)
 
     async def _on_edited_message(self, event: Any) -> None:
         source = self.sources.get(event.chat_id)
@@ -1432,36 +1448,69 @@ class TelegramInsightService:
         text = (getattr(event, "raw_text", "") or "").strip()
         if source is None or len(text) < 8:
             return
-        lowered = text.casefold()
-        matched = next((keyword for keyword in keywords if keyword.casefold() in lowered), None)
-        if matched:
-            task = asyncio.create_task(
-                self._send_alert(source, text, f"命中关键词“{matched}”", event),
-                name="keyword-alert",
-            )
-            self._alert_tasks.add(task)
-            task.add_done_callback(self._alert_tasks.discard)
-            return
-        if not any(hint.casefold() in lowered for hint in ALERT_EVENT_HINTS):
-            return
+        message_time = _event_message_time(event)
         now = dt.datetime.now(dt.timezone.utc)
-        previous = self._alert_last_sent.get(source.chat_id)
-        if previous is not None and (now - previous).total_seconds() < 120:
+        if now - message_time > ALERT_MAX_MESSAGE_AGE:
             return
-        task = asyncio.create_task(self._analyze_alert(source, text, event), name="ai-event-alert")
+        lowered = text.casefold()
+        signals = tuple(
+            signal
+            for signal in (*keywords, *ALERT_EVENT_HINTS)
+            if signal.casefold() in lowered
+        )
+        if not signals:
+            return
+        task = asyncio.create_task(
+            self._analyze_alert(source, text, event, signals), name="ai-event-alert"
+        )
         self._alert_tasks.add(task)
         task.add_done_callback(self._alert_tasks.discard)
 
-    async def _analyze_alert(self, source: SourceChat, text: str, event: Any) -> None:
+    async def _analyze_alert(
+        self, source: SourceChat, text: str, event: Any, signals: Sequence[str]
+    ) -> None:
         try:
-            alert, reason = await self.llm.detect_event(source.name, text)
-            if alert:
-                await self._send_alert(source, text, reason or "AI 判断为重要事件", event)
+            now = dt.datetime.now(dt.timezone.utc)
+            message_time = _event_message_time(event)
+            context = self.archive.recent((source.chat_id,), ALERT_CONTEXT_MESSAGES)
+            decision = await self.llm.detect_event(
+                source.name, text, context, message_time, now
+            )
+            if not decision.alert:
+                return
+            async with self._alert_lock:
+                if self._is_duplicate_alert(source.chat_id, decision, now):
+                    log.info(
+                        "Suppressed repeated event alert for chat id=%s topic=%s signals=%s",
+                        source.chat_id,
+                        decision.topic,
+                        ",".join(signals),
+                    )
+                    return
+                await self._send_alert(source, text, decision, event)
         except Exception:
             log.exception("Event alert analysis failed for chat id=%s", source.chat_id)
 
-    async def _send_alert(self, source: SourceChat, text: str, reason: str, event: Any) -> None:
-        self._alert_last_sent[source.chat_id] = dt.datetime.now(dt.timezone.utc)
+    def _is_duplicate_alert(
+        self, chat_id: int, decision: EventDecision, now: dt.datetime
+    ) -> bool:
+        topic = _alert_topic_fingerprint(decision.topic)
+        if not topic:
+            return True
+        previous = self._alert_last_sent.get((chat_id, topic))
+        if previous is None:
+            return False
+        if now - previous.sent_at < ALERT_TOPIC_COOLDOWN:
+            return True
+        if not decision.is_update:
+            return True
+        return _alert_detail_fingerprint(decision.new_information) == _alert_detail_fingerprint(
+            previous.new_information
+        )
+
+    async def _send_alert(
+        self, source: SourceChat, text: str, decision: EventDecision, event: Any
+    ) -> None:
         link = getattr(getattr(event, "message", None), "id", None)
         if link and source.username:
             link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}"
@@ -1469,8 +1518,18 @@ class TelegramInsightService:
             link_text = ""
         await self.bot.send_message(
             self.settings.summary_target,
-            f"重大事件提醒：{source.name}\n原因：{reason}\n{text[:1200]}{link_text}",
+            (
+                f"重大事件提醒 [{_alert_priority_label(decision.priority)}]：{source.name}\n"
+                f"主题：{decision.topic}\n"
+                f"原因：{decision.reason}\n"
+                f"新增信息：{decision.new_information}\n"
+                f"原消息：{text[:1200]}{link_text}"
+            ),
             link_preview=False,
+        )
+        topic = _alert_topic_fingerprint(decision.topic)
+        self._alert_last_sent[(source.chat_id, topic)] = AlertRecord(
+            dt.datetime.now(dt.timezone.utc), decision.new_information
         )
 
     async def _run_due_checkins(self, now: dt.datetime) -> None:
@@ -1929,6 +1988,29 @@ def _checkin_verification_status(
     if command or explicit_success or plain_checkin:
         return "verified"
     return None
+
+
+def _event_message_time(event: Any) -> dt.datetime:
+    value = getattr(getattr(event, "message", None), "date", None)
+    if not isinstance(value, dt.datetime):
+        return dt.datetime.now(dt.timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
+def _alert_topic_fingerprint(topic: str) -> str:
+    normalized = re.sub(r"[^\w\u3400-\u9fff]+", " ", topic.casefold(), flags=re.UNICODE)
+    return " ".join(normalized.split())[:100]
+
+
+def _alert_detail_fingerprint(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value.casefold()).strip()
+    return normalized[:500]
+
+
+def _alert_priority_label(priority: str) -> str:
+    return {"critical": "紧急", "high": "重要"}.get(priority, "重要")
 
 
 def _parse_alert_keywords(value: Any) -> tuple[str, ...]:

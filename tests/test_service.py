@@ -6,13 +6,17 @@ import pytest
 from zoneinfo import ZoneInfo
 
 from tg_insight.service import (
+    ALERT_TOPIC_COOLDOWN,
+    AlertRecord,
     CHECKIN_OFFSET_MAX_MS,
     CHECKIN_OFFSET_MIN_MS,
     CheckinConfig,
+    EventDecision,
     DEFAULT_RECENT_MESSAGES,
     SourceChat,
     TelegramInsightService,
     _checkin_configs_from_state,
+    _alert_topic_fingerprint,
     _classification_is_current,
     _checkin_verification_status,
     _content_classifications_from_state,
@@ -367,3 +371,83 @@ async def test_group_page_bulk_selection_persists_and_skips_fixed_sources() -> N
     added, removed, limited = await service._set_group_page(0, selected=False)
     assert (added, removed, limited) == (0, 7, False)
     assert set(service.sources) == {1}
+
+
+@pytest.mark.asyncio
+async def test_keyword_alert_candidate_is_reviewed_by_ai_before_sending() -> None:
+    class Archive:
+        def recent(self, _chat_ids, _limit):
+            return []
+
+    class LLM:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def detect_event(self, *args):
+            self.calls.append(args)
+            return EventDecision(False)
+
+    class Bot:
+        async def send_message(self, *_args, **_kwargs):
+            raise AssertionError("keyword candidates must not send before AI review")
+
+    service = object.__new__(TelegramInsightService)
+    service.archive = Archive()
+    service.llm = LLM()
+    service.bot = Bot()
+    service.settings = SimpleNamespace(summary_target=5361150559)
+    service.sources = {1: SourceChat(entity=object(), chat_id=1, name="群组", username=None)}
+    service._alert_tasks = set()
+    service._alert_last_sent = {}
+    service._alert_lock = asyncio.Lock()
+    service._alert_config = lambda: (True, ("发布",))
+    event = SimpleNamespace(
+        is_group=True,
+        chat_id=1,
+        raw_text="明天发布例行周报，请大家关注。",
+        message=SimpleNamespace(id=5, date=dt.datetime.now(dt.timezone.utc)),
+    )
+
+    await service._schedule_alert_analysis(event)
+    await asyncio.gather(*tuple(service._alert_tasks))
+
+    assert len(service.llm.calls) == 1
+    assert service.llm.calls[0][0:2] == ("群组", "明天发布例行周报，请大家关注。")
+
+
+@pytest.mark.asyncio
+async def test_old_alert_candidate_is_not_sent_for_ai_analysis() -> None:
+    service = object.__new__(TelegramInsightService)
+    service.sources = {1: SourceChat(entity=object(), chat_id=1, name="群组", username=None)}
+    service._alert_config = lambda: (True, ("故障",))
+    service._alert_tasks = set()
+    event = SimpleNamespace(
+        is_group=True,
+        chat_id=1,
+        raw_text="故障已在昨天恢复。",
+        message=SimpleNamespace(id=5, date=dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=2)),
+    )
+
+    await service._schedule_alert_analysis(event)
+
+    assert not service._alert_tasks
+
+
+def test_alert_deduplication_is_per_group_topic_and_requires_a_real_update() -> None:
+    service = object.__new__(TelegramInsightService)
+    now = dt.datetime(2026, 8, 19, tzinfo=dt.timezone.utc)
+    service._alert_last_sent = {
+        (1, _alert_topic_fingerprint("支付服务中断")): AlertRecord(now, "正在抢修")
+    }
+    original = EventDecision(True, "high", "服务中断", "支付服务中断", "仍在抢修", False)
+    update = EventDecision(True, "high", "服务中断", "支付服务中断", "官方公布恢复时间", True)
+
+    assert service._is_duplicate_alert(1, original, now + dt.timedelta(minutes=1))
+    assert service._is_duplicate_alert(1, original, now + ALERT_TOPIC_COOLDOWN + dt.timedelta(minutes=1))
+    assert not service._is_duplicate_alert(2, original, now + dt.timedelta(minutes=1))
+    assert not service._is_duplicate_alert(1, update, now + ALERT_TOPIC_COOLDOWN + dt.timedelta(minutes=1))
+    assert service._is_duplicate_alert(
+        1,
+        EventDecision(True, "high", "服务中断", "支付服务中断", "正在抢修", True),
+        now + ALERT_TOPIC_COOLDOWN + dt.timedelta(minutes=1),
+    )

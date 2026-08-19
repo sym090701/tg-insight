@@ -1,7 +1,7 @@
 services:
   tg-insight:
     build: .
-    image: tg-insight:0.1.18
+    image: tg-insight:0.1.19
     container_name: tg-insight
     command: ["run"]
     restart: unless-stopped
