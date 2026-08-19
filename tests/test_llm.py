@@ -113,6 +113,15 @@ def test_summary_message_budget_keeps_newest_records_within_limit() -> None:
     assert len(_records_jsonl(selected)) <= 1_300
 
 
+def test_summary_records_include_precise_timestamp_and_message_age() -> None:
+    reference = dt.datetime(2026, 8, 19, 0, 0, tzinfo=dt.timezone.utc)
+
+    record = _records_jsonl([sample()], reference)
+
+    assert '"sent_at": "2026-08-18T12:00:00+00:00"' in record
+    assert '"age_hours": 12.0' in record
+
+
 def test_group_messages_keeps_chats_separate() -> None:
     first = sample("first")
     second = replace(first, chat_id=-1002, chat_name="other group", message_id=9)
@@ -143,7 +152,10 @@ async def test_daily_digest_prioritizes_then_keeps_group_sections() -> None:
     second = replace(first, chat_id=-1002, chat_name="other group", message_id=9)
     stub = DigestLLMStub()
 
-    result = await InsightLLM.daily_digest(stub, [first, second], dt.date(2026, 8, 18))
+    cutoff = dt.datetime(2026, 8, 18, 16, 0, tzinfo=dt.timezone.utc)
+    result = await InsightLLM.daily_digest(
+        stub, [first, second], dt.date(2026, 8, 18), as_of=cutoff
+    )
 
     assert result == "final briefing"
     assert len(stub.calls) == 3
@@ -151,5 +163,10 @@ async def test_daily_digest_prioritizes_then_keeps_group_sections() -> None:
     final_records = stub.calls[-1][1]["content"]
     assert "今日最重要信息" in final_prompt
     assert "分群情报" in final_prompt
+    assert "old item as new" in final_prompt
+    assert "Analysis cutoff: 2026-08-18T16:00:00+00:00" in final_prompt
     assert "Group: group" in final_records
     assert "Group: other group" in final_records
+    first_group_records = stub.calls[0][1]["content"]
+    assert '"age_hours": 4.0' in first_group_records
+    assert "持续跟进" in stub.calls[0][0]["content"]

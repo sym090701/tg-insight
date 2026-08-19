@@ -12,6 +12,10 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   (Asia/Shanghai) time.
 - Daily summaries rank cross-group, high-information developments first, then give
   a separate intelligence update for every group with archived activity.
+- Digest records include their precise timestamp and age at analysis time. Older
+  messages are not restated as fresh news; they can reappear only as context for a
+  genuinely active, recently updated topic, and the summary must describe the new
+  development rather than repeat the original item.
 - `/content` classifies the recent text of selected groups. Adult groups identified
   automatically or marked manually are excluded from daily and on-demand summaries,
   while their messages remain archived.

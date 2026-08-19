@@ -1713,8 +1713,8 @@ class TelegramInsightService:
             if not messages:
                 await self.bot.send_message(target, "过去 24 小时没有可参与摘要的归档消息。")
                 return
-            day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date()
-            digest = await self.llm.daily_digest(messages, day)
+            now = dt.datetime.now(ZoneInfo(self.settings.timezone))
+            digest = await self.llm.daily_digest(messages, now.date(), as_of=now)
             await _send_long(self.bot, digest, target=target)
 
     async def _set_bot_commands(self) -> None:
