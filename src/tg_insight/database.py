@@ -334,6 +334,19 @@ class Archive:
                 (key, value),
             )
 
+    def backup_to(self, destination: Path) -> None:
+        """Create a consistent SQLite backup without copying a live WAL file."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = self.connect()
+        try:
+            target = sqlite3.connect(destination)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        finally:
+            source.close()
+
 
 def _clean_text(text: str) -> str:
     text = text.replace("\x00", "")

@@ -21,7 +21,19 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   personal Telegram account. Each target has its own UTC+8 schedule, message, and
   on/off switch. New targets default to 00:30, then send after a persisted random
   300-800ms delay. A successful manual or scheduled check-in is recorded for the
-  day, and failed scheduled sends retry at most three times.
+  day, and failed scheduled sends retry at most three times. Verification accepts
+  trusted Bot replies containing success phrases, a bare `签到`/`打卡` confirmation,
+  or `/qd`/`/checkin` commands, including punctuation around the command. Ordinary
+  group members and the user's own outbound command are not treated as verification.
+  `/checkin` also shows status/history, supports Topics, and can refresh the group
+  and Bot target list.
+- When an archived group contains a likely human-initiated check-in request, the
+  private management Bot asks for approval. Only the explicit “同意并部署” button
+  creates the default 00:30 automatic check-in; “忽略” does nothing.
+- `/alerts` enables keyword and AI-assisted major-event alerts. `/backup` creates
+  a consistent SQLite backup and sends it to the authorized user; the seven newest
+  backups are retained. The backup contains archived chat history, so treat it as
+  sensitive data.
 - LLM prompts treat all Telegram content as untrusted data and cannot perform Telegram actions.
 - Archive size, free disk reserve, digest input, and automatic retries have hard limits.
 
@@ -54,7 +66,10 @@ Only IDs in `TG_ALLOWED_USER_IDS` can use the bot.
 /summary          Generate the last 24-hour digest immediately
 /settings         Set daily push time or turn scheduled pushes on or off
 /content          Classify groups; reanalyze a page or every selected group
-/checkin          Add a group, configure daily check-in text/time, toggle, or run now
+/checkin          Add a group/Bot, configure text/time/Topic, history, toggle, or run now
+/alerts           Configure major-event alert switch and keywords
+/refresh          Refresh joined groups and Bot targets
+/backup           Export a consistent SQLite archive backup to the private Bot chat
 /status           Show archive size, source chats, schedule, and model
 /help             Show command help
 ```

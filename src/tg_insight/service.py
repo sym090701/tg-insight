@@ -7,6 +7,7 @@ import logging
 import random
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,28 @@ CHECKIN_OFFSET_MAX_MS = 800
 MAX_CHECKIN_TARGETS = 50
 MAX_CHECKIN_TEXT_LENGTH = 1_000
 CHECKIN_MAX_ATTEMPTS = 3
+CHECKIN_VERIFY_TIMEOUT_SECONDS = 8
+CHECKIN_HISTORY_LIMIT = 30
+CHECKIN_REPORT_STATE = "last_checkin_report_day"
+CHECKIN_REPORT_ENABLED_STATE = "checkin_report_enabled"
+CHECKIN_ALERT_STATE = "checkin_alerts"
+CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
+CHECKIN_SUCCESS_KEYWORDS = (
+    "签到成功",
+    "已签到",
+    "签到完成",
+    "获得积分",
+    "签到成功啦",
+    "恭喜签到",
+    "打卡成功",
+    "打卡完成",
+)
+CHECKIN_FAILURE_KEYWORDS = ("签到失败", "操作失败", "请稍后重试", "无权限", "已过期")
+ALERT_EVENT_HINTS = (
+    "紧急", "重要通知", "故障", "中断", "截止", "封禁", "下架", "涨价", "降价",
+    "维护", "漏洞", "攻击", "泄露", "发布", "报名", "活动", "规则更新", "breaking",
+)
+ALERT_KEYWORDS_DEFAULT = "紧急,重要通知,故障,截止,封禁,下架,涨价,维护,漏洞,攻击,泄露,发布,报名"
 
 
 @dataclass(frozen=True)
@@ -45,6 +68,18 @@ class SourceChat:
     name: str
     username: str | None
     target_kind: str = "group"
+
+
+@dataclass(frozen=True)
+class CheckinRecord:
+    day: str
+    at: str
+    status: str
+    detail: str = ""
+
+
+class CheckinVerificationError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -58,6 +93,10 @@ class CheckinConfig:
     attempt_count: int = 0
     retry_at: str = ""
     scheduled_for: str = ""
+    topic_id: int | None = None
+    last_status: str = ""
+    last_detail: str = ""
+    history: tuple[CheckinRecord, ...] = ()
 
 
 class TelegramInsightService:
@@ -94,6 +133,14 @@ class TelegramInsightService:
         self._pending_schedule_users: set[int] = set()
         self._pending_checkin_text_users: dict[int, int] = {}
         self._pending_checkin_schedule_users: dict[int, int] = {}
+        self._pending_checkin_topic_users: dict[int, int] = {}
+        self._pending_alert_keywords_users: set[int] = set()
+        self._checkin_waiters: dict[tuple[int, str], asyncio.Future[tuple[str, str]]] = {}
+        self._refresh_lock = asyncio.Lock()
+        self._alert_tasks: set[asyncio.Task[None]] = set()
+        self._alert_last_sent: dict[int, dt.datetime] = {}
+        self._checkin_suggestion_days: set[tuple[int, str]] = set()
+        self._user_id: int | None = None
 
     async def run(self) -> None:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
@@ -101,6 +148,8 @@ class TelegramInsightService:
         await self.user.connect()
         if not await self.user.is_user_authorized():
             raise RuntimeError("Telegram user session is not authorized; run auth first")
+        me = await self.user.get_me()
+        self._user_id = int(me.id)
 
         await self.bot.start(bot_token=self.settings.bot_token)
         await self._discover_source_chats()
@@ -125,8 +174,11 @@ class TelegramInsightService:
                 task.cancel()
             for task in self._classification_tasks:
                 task.cancel()
+            for task in self._alert_tasks:
+                task.cancel()
             await asyncio.gather(*self._backfill_tasks, return_exceptions=True)
             await asyncio.gather(*self._classification_tasks, return_exceptions=True)
+            await asyncio.gather(*self._alert_tasks, return_exceptions=True)
             await self.user.disconnect()
             await self.bot.disconnect()
 
@@ -267,18 +319,24 @@ class TelegramInsightService:
         self.bot.add_event_handler(self._on_settings, events.NewMessage(pattern=r"^/settings$"))
         self.bot.add_event_handler(self._on_content, events.NewMessage(pattern=r"^/content$"))
         self.bot.add_event_handler(self._on_checkin, events.NewMessage(pattern=r"^/checkin$"))
+        self.bot.add_event_handler(self._on_refresh, events.NewMessage(pattern=r"^/refresh$"))
+        self.bot.add_event_handler(self._on_alerts, events.NewMessage(pattern=r"^/alerts$"))
+        self.bot.add_event_handler(self._on_backup, events.NewMessage(pattern=r"^/backup$"))
         self.bot.add_event_handler(self._on_ask, events.NewMessage(pattern=r"^/ask(?:\s+(.+))?$"))
         self.bot.add_event_handler(self._on_groups, events.NewMessage(pattern=r"^/groups$"))
         self.bot.add_event_handler(self._on_recent, events.NewMessage(pattern=r"^/recent(?:\s+(.+))?$"))
         self.bot.add_event_handler(
             self._on_group_callback,
             events.CallbackQuery(
-                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd)(?::|$)|(?:s|st|sd)$)"
+                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki)(?::|$)|(?:s|st|sd)$)"
             ),
         )
         self.bot.add_event_handler(self._on_private_text, events.NewMessage(incoming=True))
 
     async def _on_new_message(self, event: Any) -> None:
+        await self._observe_checkin_message(event)
+        await self._suggest_checkin_from_message(event)
+        await self._schedule_alert_analysis(event)
         source = self.sources.get(event.chat_id)
         if source is not None:
             await self._store_telegram_message(source, event.message)
@@ -347,6 +405,9 @@ class TelegramInsightService:
             "/summary - 立即生成过去 24 小时摘要\n"
             "/content - 识别内容类型并排除成人群摘要\n"
             "/checkin - 管理自动签到\n"
+            "/alerts - 配置重大事件提醒\n"
+            "/refresh - 重新扫描群组和机器人\n"
+            "/backup - 导出不含凭据的消息数据库\n"
             "/settings - 设置每日推送时间和开关\n"
             "/status - 查看归档和定时任务状态\n\n"
             "也可以直接私聊发送问题。群组选择和最近消息仅在私聊中可用。"
@@ -364,6 +425,7 @@ class TelegramInsightService:
         hour, minute = self._digest_schedule()
         checkins = self._checkin_configs()
         enabled_checkins = sum(config.enabled for config in checkins.values())
+        alert_enabled, _ = self._alert_config()
         schedule = f"{hour:02d}:{minute:02d}"
         names = (
             "\n".join(f"- {source.name}" for source in self.sources.values())
@@ -377,6 +439,7 @@ class TelegramInsightService:
             f"每日推送：{'开启' if self._digest_enabled() else '已关闭'}\n"
             f"每日摘要：{schedule}（{self.settings.timezone}）\n"
             f"自动签到：{enabled_checkins}/{len(checkins)} 个群已开启\n"
+            f"重大事件提醒：{'开启' if alert_enabled else '关闭'}\n"
             f"AI 模型：{self.settings.llm_model}"
             + (
                 f"（备用：{self.settings.llm_fallback_model}）"
@@ -415,6 +478,35 @@ class TelegramInsightService:
         text, buttons = self._checkin_picker()
         await event.reply(text, buttons=buttons)
 
+    async def _on_refresh(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        await event.reply("正在重新扫描 Telegram 对话列表...")
+        count = await self._refresh_dialogs()
+        await event.reply(f"扫描完成：发现 {count} 个可签到群组或机器人。")
+
+    async def _on_alerts(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        text, buttons = self._alerts_picker()
+        await event.reply(text, buttons=buttons)
+
+    async def _on_backup(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        await event.reply("正在生成一致性数据库备份，请稍候...")
+        try:
+            path = await asyncio.to_thread(self._create_backup)
+            await self.bot.send_file(
+                event.chat_id,
+                path,
+                caption="消息数据库备份。此文件不包含 .env、Telegram 会话或 API 密钥。",
+            )
+            self._prune_backups()
+        except Exception:
+            log.exception("Database backup failed")
+            await event.reply("备份失败，请检查服务日志。")
+
     def _settings_picker(self) -> tuple[str, list[list[Any]]]:
         hour, minute = self._digest_schedule()
         enabled = self._digest_enabled()
@@ -429,6 +521,19 @@ class TelegramInsightService:
             [Button.inline("关闭每日推送" if enabled else "开启每日推送", data=b"sd")],
         ]
         return text, buttons
+
+    def _alerts_picker(self) -> tuple[str, list[list[Any]]]:
+        enabled, keywords = self._alert_config()
+        text = (
+            "重大事件提醒\n"
+            f"状态：{'开启' if enabled else '关闭'}\n"
+            f"关键词：{', '.join(keywords)}\n"
+            "命中关键词会立即提醒；同时对少量事件线索使用 AI 复核，避免普通聊天打扰。"
+        )
+        return text, [
+            [Button.inline("关闭提醒" if enabled else "开启提醒", data=b"ka")],
+            [Button.inline("修改关键词", data=b"kb")],
+        ]
 
     def _checkin_picker(self) -> tuple[str, list[list[Any]]]:
         configs = self._checkin_configs()
@@ -449,6 +554,7 @@ class TelegramInsightService:
             text = "\n".join(lines)
         buttons: list[list[Any]] = [
             [Button.inline("添加签到目标", data=b"kp:0")],
+            [Button.inline("刷新群组和机器人", data=b"kf")],
         ]
         for chat_id in sorted(configs):
             buttons.append(
@@ -508,17 +614,21 @@ class TelegramInsightService:
             return "该签到目标不存在。", [[Button.inline("返回", data=b"kc:0")]]
         state = "开启" if config.enabled else "关闭"
         last = config.last_success_day or "尚未签到"
+        topic = str(config.topic_id) if config.topic_id else "主聊天"
         text = (
             f"自动签到：{self._checkin_label(chat_id)}\n"
             f"状态：{state}\n"
             f"时间：{config.hour:02d}:{config.minute:02d}（UTC+8，随机延后 300-800ms）\n"
+            f"Topic：{topic}\n"
             f"文本：{config.text}\n"
-            f"上次成功：{last}\n"
+            f"上次状态：{config.last_status or '尚未执行'}，{last}\n"
+            f"详情：{config.last_detail or '无'}\n"
             "立即签到会计入今天，避免定时任务重复发送。"
         )
         return text, [
             [Button.inline("更改签到文本", data=f"km:{chat_id}".encode())],
             [Button.inline("更改签到时间", data=f"kt:{chat_id}".encode())],
+            [Button.inline("设置 Topic", data=f"ko:{chat_id}".encode())],
             [
                 Button.inline(
                     "关闭自动签到" if config.enabled else "开启自动签到",
@@ -527,8 +637,22 @@ class TelegramInsightService:
             ],
             [Button.inline("立即签到", data=f"kr:{chat_id}".encode())],
             [Button.inline("移除此群", data=f"kd:{chat_id}".encode())],
+            [Button.inline("查看签到记录", data=f"kh:{chat_id}".encode())],
             [Button.inline("返回列表", data=b"kc:0")],
         ]
+
+    def _checkin_history_picker(self, chat_id: int) -> tuple[str, list[list[Any]]]:
+        config = self._checkin_configs().get(chat_id)
+        if config is None:
+            return "该签到目标不存在。", [[Button.inline("返回", data=b"kc:0")]]
+        lines = [f"签到记录：{self._checkin_label(chat_id)}"]
+        if not config.history:
+            lines.append("暂无记录。")
+        else:
+            for record in reversed(config.history[-14:]):
+                detail = f"：{record.detail}" if record.detail else ""
+                lines.append(f"{record.day} {record.status}{detail}")
+        return "\n".join(lines), [[Button.inline("返回配置", data=f"kc:{chat_id}".encode())]]
 
     async def _on_ask(self, event: Any) -> None:
         if not await self._private_authorized(event):
@@ -700,6 +824,54 @@ class TelegramInsightService:
                 text, buttons = self._settings_picker()
                 await event.edit(text, buttons=buttons)
                 return
+            if action == "kf" and len(parts) == 1:
+                await event.answer("正在重新扫描 Telegram 对话...")
+                count = await self._refresh_dialogs()
+                await event.edit(f"扫描完成：发现 {count} 个可签到群组或机器人。", buttons=[[Button.inline("打开签到", data=b"kc:0")]])
+                return
+            if action == "ka" and len(parts) == 1:
+                enabled, keywords = self._alert_config()
+                self.archive.set_state(
+                    CHECKIN_ALERT_STATE,
+                    json.dumps({"enabled": not enabled, "keywords": list(keywords)}, ensure_ascii=False),
+                )
+                await event.answer("重大事件提醒已开启。" if not enabled else "重大事件提醒已关闭。")
+                text, buttons = self._alerts_picker()
+                await event.edit(text, buttons=buttons)
+                return
+            if action == "kb" and len(parts) == 1:
+                self._pending_alert_keywords_users.add(event.sender_id)
+                await event.answer()
+                await event.edit("请发送逗号分隔的关键词，例如：紧急,故障,截止,涨价")
+                return
+            if action in {"ks", "ki"} and len(parts) == 2:
+                chat_id = int(parts[1])
+                source = self.sources.get(chat_id)
+                if source is None:
+                    raise ValueError("unknown suggestion target")
+                self._checkin_suggestion_days = {
+                    item for item in self._checkin_suggestion_days if item[0] != chat_id
+                }
+                if action == "ki":
+                    await event.answer("已忽略这次签到建议。")
+                    await event.edit("已忽略这次签到建议。")
+                    return
+                configs = self._checkin_configs()
+                config = configs.get(chat_id, CheckinConfig())
+                suggestion = _checkin_suggestion_text(
+                    self.archive.get_state(CHECKIN_SUGGESTION_STATE), chat_id
+                )
+                if suggestion:
+                    config = _replace_checkin(config, text=suggestion)
+                configs[chat_id] = config
+                self._save_checkin_configs(configs)
+                await event.answer("已同意，自动签到已部署。")
+                await event.edit(
+                    f"已为“{source.name}”部署自动签到：每天 {config.hour:02d}:{config.minute:02d}，"
+                    f"随机延后 {CHECKIN_OFFSET_MIN_MS}-{CHECKIN_OFFSET_MAX_MS}ms。\n"
+                    f"文本：{config.text}"
+                )
+                return
             if action == "kp" and len(parts) == 2:
                 text, buttons = self._checkin_target_picker(int(parts[1]))
                 await event.edit(text, buttons=buttons)
@@ -711,6 +883,20 @@ class TelegramInsightService:
                 else:
                     text, buttons = self._checkin_config_picker(chat_id)
                 await event.edit(text, buttons=buttons)
+                return
+            if action == "kh" and len(parts) == 2:
+                chat_id = int(parts[1])
+                await event.answer()
+                text, buttons = self._checkin_history_picker(chat_id)
+                await event.edit(text, buttons=buttons)
+                return
+            if action == "ko" and len(parts) == 2:
+                chat_id = int(parts[1])
+                if chat_id not in self._checkin_configs():
+                    raise ValueError("unknown check-in target")
+                self._pending_checkin_topic_users[event.sender_id] = chat_id
+                await event.answer()
+                await event.edit("请发送 Topic 根消息 ID；发送 0 表示群组主聊天。机器人目标请发送 0。")
                 return
             if action == "k" and len(parts) == 3:
                 page, chat_id = int(parts[1]), int(parts[2])
@@ -898,6 +1084,41 @@ class TelegramInsightService:
             return
         if not await self._authorized(event, reply_denied=False):
             return
+        if event.sender_id in self._pending_alert_keywords_users:
+            keywords = _parse_alert_keywords(event.raw_text)
+            if not keywords:
+                await event.reply("关键词无效，请发送逗号分隔的文字关键词。")
+                return
+            enabled, _ = self._alert_config()
+            self.archive.set_state(
+                CHECKIN_ALERT_STATE,
+                json.dumps({"enabled": enabled, "keywords": list(keywords)}, ensure_ascii=False),
+            )
+            self._pending_alert_keywords_users.discard(event.sender_id)
+            await event.reply("重大事件提醒关键词已保存。")
+            return
+        chat_id = self._pending_checkin_topic_users.get(event.sender_id)
+        if chat_id is not None:
+            raw_topic = event.raw_text.strip()
+            try:
+                topic_id = int(raw_topic)
+            except ValueError:
+                topic_id = -1
+            target = self.available_checkin_targets.get(chat_id)
+            if topic_id < 0 or (target is not None and target.target_kind == "bot" and topic_id != 0):
+                await event.reply("Topic ID 无效；请发送非负整数，机器人目标只能发送 0。")
+                return
+            configs = self._checkin_configs()
+            config = configs.get(chat_id)
+            if config is None:
+                self._pending_checkin_topic_users.pop(event.sender_id, None)
+                await event.reply("签到目标已不存在，请重新发送 /checkin。")
+                return
+            configs[chat_id] = _replace_checkin(config, topic_id=topic_id or None)
+            self._save_checkin_configs(configs)
+            self._pending_checkin_topic_users.pop(event.sender_id, None)
+            await event.reply("Topic 已保存。发送 0 可恢复主聊天。")
+            return
         chat_id = self._pending_checkin_text_users.get(event.sender_id)
         if chat_id is not None:
             text = event.raw_text.strip()
@@ -1039,6 +1260,39 @@ class TelegramInsightService:
             ),
         )
 
+    def _alert_config(self) -> tuple[bool, tuple[str, ...]]:
+        try:
+            raw = json.loads(self.archive.get_state(CHECKIN_ALERT_STATE) or "{}")
+        except json.JSONDecodeError:
+            raw = {}
+        if not isinstance(raw, dict):
+            raw = {}
+        enabled = bool(raw.get("enabled", True))
+        keywords = _parse_alert_keywords(raw.get("keywords", ALERT_KEYWORDS_DEFAULT))
+        return enabled, keywords or _parse_alert_keywords(ALERT_KEYWORDS_DEFAULT)
+
+    async def _refresh_dialogs(self) -> int:
+        async with self._refresh_lock:
+            await self._discover_source_chats()
+            await self._resolve_sources()
+            return len(self.available_checkin_targets)
+
+    def _create_backup(self) -> Path:
+        backup_dir = self.settings.data_dir / "backups"
+        stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = backup_dir / f"messages-{stamp}.db"
+        self.archive.backup_to(path)
+        return path
+
+    def _prune_backups(self, keep: int = 7) -> None:
+        backup_dir = self.settings.data_dir / "backups"
+        paths = sorted(backup_dir.glob("messages-*.db"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in paths[keep:]:
+            try:
+                path.unlink()
+            except OSError:
+                log.warning("Unable to prune backup %s", path)
+
     async def _ensure_checkin(self, chat_id: int) -> None:
         async with self._checkin_lock:
             configs = self._checkin_configs()
@@ -1052,18 +1306,172 @@ class TelegramInsightService:
             target = self.available_checkin_targets.get(chat_id)
             if config is None or target is None:
                 raise ValueError("check-in target is unavailable")
-            await self.user.send_message(target.entity, config.text, link_preview=False)
-            if mark_today:
-                today = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
-                configs[chat_id] = _replace_checkin(
-                    config,
-                    last_success_day=today,
-                    attempt_day=today,
+            sent_at = dt.datetime.now(ZoneInfo(self.settings.timezone))
+            day = sent_at.date().isoformat()
+            waiter: asyncio.Future[tuple[str, str]] = asyncio.get_running_loop().create_future()
+            self._checkin_waiters[(chat_id, day)] = waiter
+            try:
+                send_kwargs: dict[str, Any] = {"link_preview": False}
+                if target.target_kind == "group" and config.topic_id:
+                    send_kwargs["reply_to"] = config.topic_id
+                sent_message = await self.user.send_message(target.entity, config.text, **send_kwargs)
+            except Exception as exc:
+                self._checkin_waiters.pop((chat_id, day), None)
+                detail = _safe_error(exc)
+                configs[chat_id] = _append_checkin_record(config, "send_failed", detail, sent_at)
+                self._save_checkin_configs(configs)
+                raise
+
+            try:
+                status, detail = await asyncio.wait_for(
+                    waiter, timeout=CHECKIN_VERIFY_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                status, detail = "sent_unverified", "已发送，等待窗口内未发现明确成功回复"
+            finally:
+                self._checkin_waiters.pop((chat_id, day), None)
+
+            latest = self._checkin_configs().get(chat_id, config)
+            latest = _append_checkin_record(latest, status, detail, sent_at)
+            if mark_today and status in {"verified", "sent_unverified"}:
+                latest = _replace_checkin(
+                    latest,
+                    last_success_day=day,
+                    attempt_day=day,
                     attempt_count=0,
                     retry_at="",
                     scheduled_for="",
                 )
-                self._save_checkin_configs(configs)
+            self._save_checkin_configs({**self._checkin_configs(), chat_id: latest})
+            if status == "failed":
+                raise CheckinVerificationError(detail)
+            if status == "send_failed":
+                raise CheckinVerificationError(detail)
+
+    async def _observe_checkin_message(self, event: Any) -> None:
+        # The user's own outbound command is not a verification response. This
+        # matters for direct Bot targets where the target kind is otherwise
+        # trusted before the Bot has had a chance to reply.
+        if getattr(event, "out", False):
+            return
+        chat_id = getattr(event, "chat_id", None)
+        if chat_id is None:
+            return
+        configs = self._checkin_configs()
+        if int(chat_id) not in configs:
+            return
+        key = (int(chat_id), dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat())
+        waiter = self._checkin_waiters.get(key)
+        if waiter is None or waiter.done():
+            return
+        text = (getattr(event, "raw_text", "") or "").strip()
+        if not text:
+            return
+        target = self.available_checkin_targets.get(int(chat_id))
+        sender = getattr(getattr(event, "message", None), "sender", None)
+        if sender is None:
+            sender = getattr(event, "sender", None)
+        from_bot = bool(getattr(sender, "bot", False))
+        status = _checkin_verification_status(
+            text,
+            from_bot=from_bot,
+            target_kind=target.target_kind if target is not None else None,
+        )
+        if status is not None:
+            waiter.set_result((status, text[:300]))
+
+    async def _suggest_checkin_from_message(self, event: Any) -> None:
+        chat_id = getattr(event, "chat_id", None)
+        source = self.sources.get(chat_id)
+        text = (getattr(event, "raw_text", "") or "").strip()
+        if source is None or not text or len(text) > MAX_CHECKIN_TEXT_LENGTH:
+            return
+        sender = getattr(getattr(event, "message", None), "sender", None)
+        if getattr(sender, "bot", False) or getattr(sender, "id", None) == self._user_id:
+            return
+        lowered = text.casefold()
+        if not any(token in lowered for token in ("/checkin", "签到", "打卡", "签到一下")):
+            return
+        if any(token in lowered for token in ("签到成功", "已签到", "签到完成")):
+            return
+        day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
+        key = (int(chat_id), day)
+        if key in self._checkin_suggestion_days or int(chat_id) in self._checkin_configs():
+            return
+        self._checkin_suggestion_days.add(key)
+        self.archive.set_state(
+            CHECKIN_SUGGESTION_STATE,
+            json.dumps({str(chat_id): {"day": day, "text": text[:300]}}, ensure_ascii=False),
+        )
+        await self.bot.send_message(
+            self.settings.summary_target,
+            f"发现群组“{source.name}”有人发起签到。\n"
+            f"要为该群部署每天 {DEFAULT_CHECKIN_HOUR:02d}:{DEFAULT_CHECKIN_MINUTE:02d} 的自动签到吗？\n"
+            f"拟发送文本：{text[:300]}",
+            buttons=[
+                [
+                    Button.inline("同意并部署", data=f"ks:{chat_id}".encode()),
+                    Button.inline("忽略", data=f"ki:{chat_id}".encode()),
+                ]
+            ],
+            link_preview=False,
+        )
+
+    async def _notify_checkin_failure(self, chat_id: int, detail: str) -> None:
+        await self.bot.send_message(
+            self.settings.summary_target,
+            f"自动签到失败：{self._checkin_label(chat_id)}\n{detail[:500]}",
+            link_preview=False,
+        )
+
+    async def _schedule_alert_analysis(self, event: Any) -> None:
+        enabled, keywords = self._alert_config()
+        if not enabled or not getattr(event, "is_group", False):
+            return
+        source = self.sources.get(getattr(event, "chat_id", None))
+        text = (getattr(event, "raw_text", "") or "").strip()
+        if source is None or len(text) < 8:
+            return
+        lowered = text.casefold()
+        matched = next((keyword for keyword in keywords if keyword.casefold() in lowered), None)
+        if matched:
+            task = asyncio.create_task(
+                self._send_alert(source, text, f"命中关键词“{matched}”", event),
+                name="keyword-alert",
+            )
+            self._alert_tasks.add(task)
+            task.add_done_callback(self._alert_tasks.discard)
+            return
+        if not any(hint.casefold() in lowered for hint in ALERT_EVENT_HINTS):
+            return
+        now = dt.datetime.now(dt.timezone.utc)
+        previous = self._alert_last_sent.get(source.chat_id)
+        if previous is not None and (now - previous).total_seconds() < 120:
+            return
+        task = asyncio.create_task(self._analyze_alert(source, text, event), name="ai-event-alert")
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
+
+    async def _analyze_alert(self, source: SourceChat, text: str, event: Any) -> None:
+        try:
+            alert, reason = await self.llm.detect_event(source.name, text)
+            if alert:
+                await self._send_alert(source, text, reason or "AI 判断为重要事件", event)
+        except Exception:
+            log.exception("Event alert analysis failed for chat id=%s", source.chat_id)
+
+    async def _send_alert(self, source: SourceChat, text: str, reason: str, event: Any) -> None:
+        self._alert_last_sent[source.chat_id] = dt.datetime.now(dt.timezone.utc)
+        link = getattr(getattr(event, "message", None), "id", None)
+        if link and source.username:
+            link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}"
+        else:
+            link_text = ""
+        await self.bot.send_message(
+            self.settings.summary_target,
+            f"重大事件提醒：{source.name}\n原因：{reason}\n{text[:1200]}{link_text}",
+            link_preview=False,
+        )
 
     async def _run_due_checkins(self, now: dt.datetime) -> None:
         today = now.date().isoformat()
@@ -1101,6 +1509,12 @@ class TelegramInsightService:
                         retry_at=(now + _digest_retry_delay(attempt)).isoformat(),
                     )
                     self._save_checkin_configs(configs)
+                    if attempt >= CHECKIN_MAX_ATTEMPTS:
+                        await self._notify_checkin_failure(chat_id, latest.last_detail or "达到最大重试次数")
+            else:
+                latest = configs.get(chat_id)
+                if latest is not None and latest.last_status == "sent_unverified":
+                    await self._notify_checkin_failure(chat_id, latest.last_detail)
 
     def _scheduled_checkin_at(
         self,
@@ -1218,6 +1632,7 @@ class TelegramInsightService:
         while True:
             now = dt.datetime.now(zone)
             await self._run_due_checkins(now)
+            await self._maybe_send_checkin_report(now)
             day_key = now.date().isoformat()
             attempt_day = self.archive.get_state("digest_attempt_day")
             if attempt_day != day_key:
@@ -1252,6 +1667,36 @@ class TelegramInsightService:
                     )
             await asyncio.sleep(max(0.05, self._next_checkin_delay(now)))
 
+    async def _maybe_send_checkin_report(self, now: dt.datetime) -> None:
+        if self.archive.get_state(CHECKIN_REPORT_ENABLED_STATE) == "0":
+            return
+        day = now.date().isoformat()
+        if self.archive.get_state(CHECKIN_REPORT_STATE) == day:
+            return
+        configs = self._checkin_configs()
+        enabled = {chat_id: config for chat_id, config in configs.items() if config.enabled}
+        if not enabled:
+            return
+        zone = ZoneInfo(self.settings.timezone)
+        for config in enabled.values():
+            base = dt.datetime.combine(now.date(), dt.time(config.hour, config.minute), tzinfo=zone)
+            if now < base:
+                return
+            if config.last_success_day == day:
+                continue
+            scheduled = _state_datetime(config.scheduled_for, zone)
+            if scheduled is None or scheduled > now:
+                return
+            attempts = config.attempt_count if config.attempt_day == day else 0
+            if attempts < CHECKIN_MAX_ATTEMPTS:
+                return
+        lines = [f"签到日报（{day}）"]
+        for chat_id, config in sorted(enabled.items(), key=lambda item: self._checkin_label(item[0])):
+            detail = f"：{config.last_detail}" if config.last_detail else ""
+            lines.append(f"- {self._checkin_label(chat_id)}：{config.last_status or '未执行'}{detail}")
+        await self.bot.send_message(self.settings.summary_target, "\n".join(lines), link_preview=False)
+        self.archive.set_state(CHECKIN_REPORT_STATE, day)
+
     async def _send_digest(self, target: int | str) -> None:
         async with self._digest_lock:
             now = dt.datetime.now(dt.timezone.utc)
@@ -1284,6 +1729,9 @@ class TelegramInsightService:
                     types.BotCommand(command="summary", description="生成过去 24 小时摘要"),
                     types.BotCommand(command="content", description="管理成人内容摘要排除"),
                     types.BotCommand(command="checkin", description="管理自动签到"),
+                    types.BotCommand(command="alerts", description="配置重大事件提醒"),
+                    types.BotCommand(command="refresh", description="刷新群组和机器人列表"),
+                    types.BotCommand(command="backup", description="导出消息数据库备份"),
                     types.BotCommand(command="settings", description="设置每日推送"),
                     types.BotCommand(command="status", description="查看归档状态"),
                     types.BotCommand(command="help", description="查看帮助"),
@@ -1365,6 +1813,15 @@ def _checkin_configs_from_state(value: str | None) -> dict[int, CheckinConfig]:
         attempt_count = raw_config.get("attempt_count", 0)
         if not isinstance(attempt_count, int) or not 0 <= attempt_count <= CHECKIN_MAX_ATTEMPTS:
             attempt_count = 0
+        topic_id = raw_config.get("topic_id")
+        if topic_id is not None:
+            try:
+                topic_id = int(topic_id)
+            except (TypeError, ValueError):
+                topic_id = None
+            if topic_id is not None and topic_id <= 0:
+                topic_id = None
+        history = _checkin_history_from_state(raw_config.get("history"))
         configs[chat_id] = CheckinConfig(
             enabled=bool(raw_config.get("enabled", True)),
             text=text,
@@ -1375,6 +1832,10 @@ def _checkin_configs_from_state(value: str | None) -> dict[int, CheckinConfig]:
             attempt_count=attempt_count,
             retry_at=_safe_datetime(raw_config.get("retry_at")),
             scheduled_for=_safe_datetime(raw_config.get("scheduled_for")),
+            topic_id=topic_id,
+            last_status=str(raw_config.get("last_status", ""))[:40],
+            last_detail=str(raw_config.get("last_detail", ""))[:300],
+            history=history,
         )
         if len(configs) >= MAX_CHECKIN_TARGETS:
             break
@@ -1392,13 +1853,111 @@ def _checkin_config_to_json(config: CheckinConfig) -> dict[str, str | int | bool
         "attempt_count": config.attempt_count,
         "retry_at": config.retry_at,
         "scheduled_for": config.scheduled_for,
+        "topic_id": config.topic_id,
+        "last_status": config.last_status,
+        "last_detail": config.last_detail,
+        "history": [
+            {"day": record.day, "at": record.at, "status": record.status, "detail": record.detail}
+            for record in config.history[-CHECKIN_HISTORY_LIMIT:]
+        ],
     }
 
 
 def _replace_checkin(config: CheckinConfig, **changes: Any) -> CheckinConfig:
     values = _checkin_config_to_json(config)
     values.update(changes)
+    if isinstance(values.get("history"), list):
+        values["history"] = _checkin_history_from_state(values["history"])
     return CheckinConfig(**values)
+
+
+def _checkin_history_from_state(value: Any) -> tuple[CheckinRecord, ...]:
+    if not isinstance(value, list):
+        return ()
+    records: list[CheckinRecord] = []
+    for item in value[-CHECKIN_HISTORY_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        day = _safe_day(item.get("day"))
+        if not day:
+            continue
+        records.append(
+            CheckinRecord(
+                day=day,
+                at=_safe_datetime(item.get("at")),
+                status=str(item.get("status", "unknown"))[:40],
+                detail=str(item.get("detail", ""))[:300],
+            )
+        )
+    return tuple(records)
+
+
+def _append_checkin_record(config: CheckinConfig, status: str, detail: str, now: dt.datetime) -> CheckinConfig:
+    record = CheckinRecord(
+        day=now.date().isoformat(),
+        at=now.isoformat(),
+        status=status,
+        detail=detail[:300],
+    )
+    history = tuple((*config.history, record)[-CHECKIN_HISTORY_LIMIT:])
+    return _replace_checkin(config, last_status=status, last_detail=detail[:300], history=history)
+
+
+def _checkin_verification_status(
+    text: str,
+    *,
+    from_bot: bool,
+    target_kind: str | None,
+) -> str | None:
+    """Classify a likely check-in response without trusting ordinary group members."""
+    normalized = re.sub(r"\s+", " ", text.casefold()).strip()
+    if not normalized:
+        return None
+    if any(keyword.casefold() in normalized for keyword in CHECKIN_FAILURE_KEYWORDS):
+        return "failed"
+
+    # A bot target is already the direct recipient. For group targets, only a
+    # message authored by a Telegram bot is trusted as the automated response.
+    trusted_sender = from_bot or target_kind == "bot"
+    if not trusted_sender:
+        return None
+    command = bool(re.search(r"(?<![a-z0-9_])/(?:qd|checkin)(?![a-z0-9_])", normalized))
+    explicit_success = any(keyword.casefold() in normalized for keyword in CHECKIN_SUCCESS_KEYWORDS)
+    plain_checkin = "签到" in normalized and not any(
+        marker in normalized for marker in ("请发送", "请输入", "回复", "输入")
+    )
+    if command or explicit_success or plain_checkin:
+        return "verified"
+    return None
+
+
+def _parse_alert_keywords(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        values = re.split(r"[,，\\n]", value)
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        return ()
+    result: list[str] = []
+    for item in values:
+        text = " ".join(str(item).split())[:40]
+        if text and text.casefold() not in {value.casefold() for value in result}:
+            result.append(text)
+    return tuple(result[:20])
+
+
+def _checkin_suggestion_text(value: str | None, chat_id: int) -> str:
+    try:
+        raw = json.loads(value or "{}")
+    except json.JSONDecodeError:
+        return DEFAULT_CHECKIN_TEXT
+    if not isinstance(raw, dict):
+        return DEFAULT_CHECKIN_TEXT
+    item = raw.get(str(chat_id), {})
+    if not isinstance(item, dict):
+        return DEFAULT_CHECKIN_TEXT
+    text = str(item.get("text", "")).strip()
+    return text[:MAX_CHECKIN_TEXT_LENGTH] or DEFAULT_CHECKIN_TEXT
 
 
 def _safe_day(value: Any) -> str:
@@ -1413,6 +1972,11 @@ def _safe_datetime(value: Any) -> str:
         return dt.datetime.fromisoformat(str(value)).isoformat()
     except (TypeError, ValueError):
         return ""
+
+
+def _safe_error(exc: Exception) -> str:
+    text = " ".join(str(exc).split())
+    return text[:300] or type(exc).__name__
 
 
 CONTENT_STATUS_LABELS = {

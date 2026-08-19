@@ -14,6 +14,7 @@ from tg_insight.service import (
     TelegramInsightService,
     _checkin_configs_from_state,
     _classification_is_current,
+    _checkin_verification_status,
     _content_classifications_from_state,
     _content_overrides_from_state,
     _content_status,
@@ -187,9 +188,13 @@ async def test_due_checkin_sends_once_and_persists_today() -> None:
         def set_state(self, key, value):
             state[key] = value
 
+    service_ref: dict[str, TelegramInsightService] = {}
+
     class User:
         async def send_message(self, entity, text, **_kwargs):
             sent.append((entity, text))
+            waiter = next(iter(service_ref["service"]._checkin_waiters.values()))
+            waiter.set_result(("verified", "签到"))
 
     service = object.__new__(TelegramInsightService)
     service.settings = SimpleNamespace(timezone="Asia/Shanghai")
@@ -200,6 +205,8 @@ async def test_due_checkin_sends_once_and_persists_today() -> None:
     }
     service.available_checkin_targets = service.available_sources
     service._checkin_lock = asyncio.Lock()
+    service._checkin_waiters = {}
+    service_ref["service"] = service
 
     now = dt.datetime(2026, 8, 18, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
     await service._run_due_checkins(now)
@@ -212,7 +219,68 @@ async def test_due_checkin_sends_once_and_persists_today() -> None:
     await service._run_due_checkins(now + dt.timedelta(seconds=1))
 
     assert sent == [("target", "@bot /checkin")]
-    assert _checkin_configs_from_state(state["checkin_configs"])[-1001].last_success_day == "2026-08-18"
+    assert _checkin_configs_from_state(state["checkin_configs"])[-1001].last_success_day == dt.datetime.now(
+        ZoneInfo("Asia/Shanghai")
+    ).date().isoformat()
+
+
+@pytest.mark.asyncio
+async def test_outbound_bot_command_is_not_checkin_verification() -> None:
+    state = {"checkin_configs": '{"42":{"text":"/checkin"}}'}
+
+    class Archive:
+        def get_state(self, key):
+            return state.get(key)
+
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(timezone="Asia/Shanghai")
+    service.archive = Archive()
+    service.available_checkin_targets = {
+        42: SourceChat(entity="bot", chat_id=42, name="签到机器人", username=None, target_kind="bot")
+    }
+    service._checkin_waiters = {}
+    key = (42, dt.datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat())
+    waiter = asyncio.get_running_loop().create_future()
+    service._checkin_waiters[key] = waiter
+
+    await service._observe_checkin_message(
+        SimpleNamespace(
+            out=True,
+            chat_id=42,
+            raw_text="/checkin",
+            message=SimpleNamespace(sender=SimpleNamespace(bot=False)),
+        )
+    )
+    assert not waiter.done()
+
+    await service._observe_checkin_message(
+        SimpleNamespace(
+            out=False,
+            chat_id=42,
+            raw_text="签到",
+            message=SimpleNamespace(sender=SimpleNamespace(bot=True)),
+        )
+    )
+    assert waiter.result() == ("verified", "签到")
+
+
+@pytest.mark.parametrize(
+    ("text", "from_bot", "target_kind", "expected"),
+    [
+        ("签到", True, "group", "verified"),
+        ("签到成功啦！", True, "group", "verified"),
+        ("请回复 /qd 完成签到", True, "group", "verified"),
+        ("@user /qd", False, "group", None),
+        ("签到失败，请稍后重试", True, "group", "failed"),
+        ("/qd", False, "bot", "verified"),
+    ],
+)
+def test_checkin_verification_accepts_flexible_bot_responses(
+    text: str, from_bot: bool, target_kind: str, expected: str | None
+) -> None:
+    assert _checkin_verification_status(
+        text, from_bot=from_bot, target_kind=target_kind
+    ) == expected
 
 
 @pytest.mark.asyncio
