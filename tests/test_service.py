@@ -10,6 +10,7 @@ from tg_insight.service import (
     ALERT_TOPIC_COOLDOWN,
     AlertRecord,
     CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS,
+    CHECKIN_SUGGESTION_IGNORES_STATE,
     CheckinSuggestionCandidate,
     CheckinSuggestionDecision,
     CHECKIN_OFFSET_MAX_MS,
@@ -565,3 +566,57 @@ def test_checkin_suggestion_only_associates_a_direct_bot_reply() -> None:
         SimpleNamespace(chat_id=-1001, message=SimpleNamespace(reply_to_msg_id=7)), "签到成功"
     )
     assert candidate.bot_reply == "签到成功"
+
+
+def test_checkin_suggestion_ignores_are_persisted_for_today_seven_days_or_forever() -> None:
+    state: dict[str, str] = {}
+    service = object.__new__(TelegramInsightService)
+    service.archive = SimpleNamespace(get_state=state.get, set_state=state.__setitem__)
+    today = dt.date(2026, 8, 20)
+
+    service._set_checkin_suggestion_ignore(1, until=today, permanent=False)
+    assert service._checkin_suggestion_ignored(1, today)
+    assert not service._checkin_suggestion_ignored(1, today + dt.timedelta(days=1))
+
+    service._set_checkin_suggestion_ignore(1, until=today + dt.timedelta(days=6), permanent=False)
+    assert service._checkin_suggestion_ignored(1, today + dt.timedelta(days=6))
+    assert not service._checkin_suggestion_ignored(1, today + dt.timedelta(days=7))
+
+    service._set_checkin_suggestion_ignore(1, until=None, permanent=True)
+    assert service._checkin_suggestion_ignored(1, today + dt.timedelta(days=10_000))
+    assert CHECKIN_SUGGESTION_IGNORES_STATE in state
+
+
+@pytest.mark.asyncio
+async def test_unarchived_group_is_listened_for_checkin_without_writing_messages() -> None:
+    state: dict[str, str] = {}
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(timezone="Asia/Shanghai")
+    service.sources = {}
+    service.available_sources = {
+        -1001: SourceChat(entity=object(), chat_id=-1001, name="未归档群", username="untracked")
+    }
+    service.archive = SimpleNamespace(get_state=state.get, set_state=state.__setitem__)
+    service._checkin_suggestion_days = set()
+    service._checkin_suggestion_candidates = {}
+    service._checkin_suggestion_tasks = set()
+    service._checkin_configs = lambda: {}
+    service._user_id = 5361150559
+
+    await service._suggest_checkin_from_message(
+        SimpleNamespace(
+            chat_id=-1001,
+            raw_text="@daily_bot /qd",
+            message=SimpleNamespace(
+                id=7,
+                date=dt.datetime.now(dt.timezone.utc),
+                sender=SimpleNamespace(id=111, bot=False, first_name="Alice"),
+            ),
+        )
+    )
+
+    assert (-1001, 7) in service._checkin_suggestion_candidates
+    assert not state
+    for task in service._checkin_suggestion_tasks:
+        task.cancel()
+    await asyncio.gather(*service._checkin_suggestion_tasks, return_exceptions=True)

@@ -50,6 +50,7 @@ CHECKIN_REPORT_STATE = "last_checkin_report_day"
 CHECKIN_REPORT_ENABLED_STATE = "checkin_report_enabled"
 CHECKIN_ALERT_STATE = "checkin_alerts"
 CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
+CHECKIN_SUGGESTION_IGNORES_STATE = "checkin_suggestion_ignores"
 CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
 CHECKIN_SUCCESS_KEYWORDS = (
     "签到成功",
@@ -366,7 +367,7 @@ class TelegramInsightService:
         self.bot.add_event_handler(
             self._on_group_callback,
             events.CallbackQuery(
-                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki)(?::|$)|(?:s|st|sd)$)"
+                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx)(?::|$)|(?:s|st|sd)$)"
             ),
         )
         self.bot.add_event_handler(self._on_private_text, events.NewMessage(incoming=True))
@@ -882,17 +883,24 @@ class TelegramInsightService:
                 await event.answer()
                 await event.edit("请发送逗号分隔的关键词，例如：紧急,故障,截止,涨价")
                 return
-            if action in {"ks", "ki"} and len(parts) == 2:
+            if action in {"ks", "ki", "k7", "kx"} and len(parts) == 2:
                 chat_id = int(parts[1])
-                source = self.sources.get(chat_id)
+                source = self.available_sources.get(chat_id)
                 if source is None:
                     raise ValueError("unknown suggestion target")
                 self._checkin_suggestion_days = {
                     item for item in self._checkin_suggestion_days if item[0] != chat_id
                 }
-                if action == "ki":
-                    await event.answer("已忽略这次签到建议。")
-                    await event.edit("已忽略这次签到建议。")
+                if action in {"ki", "k7", "kx"}:
+                    until = {
+                        "ki": dt.datetime.now(ZoneInfo(self.settings.timezone)).date(),
+                        "k7": dt.datetime.now(ZoneInfo(self.settings.timezone)).date()
+                        + dt.timedelta(days=6),
+                    }.get(action)
+                    self._set_checkin_suggestion_ignore(chat_id, until=until, permanent=action == "kx")
+                    label = {"ki": "今天", "k7": "未来 7 天", "kx": "永久"}[action]
+                    await event.answer(f"已忽略：{label}不再提示。")
+                    await event.edit(f"已忽略“{source.name}”的签到建议：{label}不再提示。")
                     return
                 configs = self._checkin_configs()
                 config = configs.get(chat_id, CheckinConfig())
@@ -1420,7 +1428,7 @@ class TelegramInsightService:
 
     async def _suggest_checkin_from_message(self, event: Any) -> None:
         chat_id = getattr(event, "chat_id", None)
-        source = self.sources.get(chat_id)
+        source = self.available_sources.get(chat_id)
         text = (getattr(event, "raw_text", "") or "").strip()
         if source is None or not text or len(text) > MAX_CHECKIN_TEXT_LENGTH:
             return
@@ -1436,7 +1444,11 @@ class TelegramInsightService:
             return
         day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
         key = (int(chat_id), day)
-        if key in self._checkin_suggestion_days or int(chat_id) in self._checkin_configs():
+        if (
+            key in self._checkin_suggestion_days
+            or int(chat_id) in self._checkin_configs()
+            or self._checkin_suggestion_ignored(int(chat_id), dt.date.fromisoformat(day))
+        ):
             return
         message = getattr(event, "message", None)
         message_id = getattr(message, "id", None)
@@ -1479,7 +1491,11 @@ class TelegramInsightService:
                 return
             day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
             key = (candidate.chat_id, day)
-            if key in self._checkin_suggestion_days or candidate.chat_id in self._checkin_configs():
+            if (
+                key in self._checkin_suggestion_days
+                or candidate.chat_id in self._checkin_configs()
+                or self._checkin_suggestion_ignored(candidate.chat_id, dt.date.fromisoformat(day))
+            ):
                 return
             decision = await self.llm.assess_checkin_suggestion(
                 candidate.source_name,
@@ -1514,8 +1530,12 @@ class TelegramInsightService:
                 buttons=[
                     [
                         Button.inline("同意并部署", data=f"ks:{candidate.chat_id}".encode()),
-                        Button.inline("忽略", data=f"ki:{candidate.chat_id}".encode()),
-                    ]
+                        Button.inline("今天忽略", data=f"ki:{candidate.chat_id}".encode()),
+                    ],
+                    [
+                        Button.inline("7 天忽略", data=f"k7:{candidate.chat_id}".encode()),
+                        Button.inline("永久忽略", data=f"kx:{candidate.chat_id}".encode()),
+                    ],
                 ],
                 link_preview=False,
             )
@@ -1534,14 +1554,44 @@ class TelegramInsightService:
         saved[str(candidate.chat_id)] = {
             "day": day,
             "text": decision.proposed_text,
-            "source_message_id": candidate.message_id,
-            "source_text": candidate.source_text[:300],
-            "bot_reply": candidate.bot_reply[:500],
-            "reason": decision.reason,
         }
         self.archive.set_state(
             CHECKIN_SUGGESTION_STATE,
             json.dumps(saved, ensure_ascii=False),
+        )
+
+    def _checkin_suggestion_ignored(self, chat_id: int, today: dt.date) -> bool:
+        try:
+            values = json.loads(self.archive.get_state(CHECKIN_SUGGESTION_IGNORES_STATE) or "{}")
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(values, dict):
+            return False
+        item = values.get(str(chat_id))
+        if not isinstance(item, dict):
+            return False
+        if bool(item.get("permanent")):
+            return True
+        try:
+            return dt.date.fromisoformat(str(item.get("until", ""))) >= today
+        except ValueError:
+            return False
+
+    def _set_checkin_suggestion_ignore(
+        self, chat_id: int, *, until: dt.date | None, permanent: bool
+    ) -> None:
+        try:
+            values = json.loads(self.archive.get_state(CHECKIN_SUGGESTION_IGNORES_STATE) or "{}")
+        except json.JSONDecodeError:
+            values = {}
+        if not isinstance(values, dict):
+            values = {}
+        values[str(chat_id)] = {
+            "permanent": permanent,
+            "until": "" if permanent or until is None else until.isoformat(),
+        }
+        self.archive.set_state(
+            CHECKIN_SUGGESTION_IGNORES_STATE, json.dumps(values, ensure_ascii=False)
         )
 
     async def _notify_checkin_failure(self, chat_id: int, detail: str) -> None:
