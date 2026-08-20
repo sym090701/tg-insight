@@ -31,9 +31,13 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   group members and the user's own outbound command are not treated as verification.
   `/checkin` also shows status/history, supports Topics, and can refresh the group
   and Bot target list.
-- When an archived group contains a likely human-initiated check-in request, the
-  private management Bot asks for approval. Only the explicit “同意并部署” button
-  creates the default 00:30 automatic check-in; “忽略” does nothing.
+- When an archived group contains an explicit `/qd`, `/checkin`, or Bot-directed
+  check-in action, the service waits briefly for that message's direct Bot reply.
+  It proposes automation only after a high-confidence AI review confirms the
+  exchange represents a real reusable check-in. The private management Bot shows
+  the source message, sender/time/link, Bot reply, AI reason, and exact proposed
+  command. Only “同意并部署” creates the default 00:30 automatic check-in; “忽略”
+  does nothing.
 - `/alerts` enables major-event alerts. Keywords are only candidate signals: AI
   verifies the target message against its timestamp and recent same-group context,
   ignores stale forwards and ordinary discussion, and suppresses repeated topics

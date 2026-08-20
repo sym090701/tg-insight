@@ -8,6 +8,7 @@ import pytest
 from tg_insight.database import StoredMessage
 from tg_insight.llm import (
     Answer,
+    CheckinSuggestionDecision,
     EventDecision,
     InsightLLM,
     _batch_messages,
@@ -119,6 +120,39 @@ async def test_event_detection_fails_closed_for_incomplete_or_invalid_results() 
     decision = await stub.detect_event("群组", "可能有重要通知", [], now, now)
 
     assert decision == EventDecision(False)
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_requires_a_high_confidence_grounded_result() -> None:
+    stub = EventLLMStub(
+        '{"should_suggest":true,"confidence":"high","reason":"命令已被 Bot 确认成功",'
+        '"proposed_text":"@daily_bot /qd"}'
+    )
+    source_time = dt.datetime(2026, 8, 19, 0, 0, tzinfo=dt.timezone.utc)
+
+    decision = await stub.assess_checkin_suggestion(
+        "群组", "Alice", source_time, "@daily_bot /qd", "签到成功，获得 1 积分"
+    )
+
+    assert decision == CheckinSuggestionDecision(
+        True, "high", "命令已被 Bot 确认成功", "@daily_bot /qd"
+    )
+    prompt = stub.calls[0][0]["content"]
+    records = stub.calls[0][1]["content"]
+    assert "direct Bot reply" in prompt
+    assert "exact contiguous excerpt" in prompt
+    assert "Source message:\n@daily_bot /qd" in records
+    assert "Direct Bot reply:\n签到成功" in records
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_fails_closed_without_high_confidence() -> None:
+    stub = EventLLMStub('{"should_suggest":true,"confidence":"medium","reason":"可能是签到"}')
+    now = dt.datetime(2026, 8, 19, tzinfo=dt.timezone.utc)
+
+    decision = await stub.assess_checkin_suggestion("群组", "Alice", now, "/qd", "好的")
+
+    assert decision == CheckinSuggestionDecision(False)
 
 
 class FallbackCompletions:

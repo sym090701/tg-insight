@@ -1,5 +1,6 @@
 import asyncio
 import datetime as dt
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +9,9 @@ from zoneinfo import ZoneInfo
 from tg_insight.service import (
     ALERT_TOPIC_COOLDOWN,
     AlertRecord,
+    CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS,
+    CheckinSuggestionCandidate,
+    CheckinSuggestionDecision,
     CHECKIN_OFFSET_MAX_MS,
     CHECKIN_OFFSET_MIN_MS,
     CheckinConfig,
@@ -32,6 +36,7 @@ from tg_insight.service import (
     _state_int,
     _state_int_in_range,
     _summary_excluded,
+    _is_checkin_suggestion_candidate,
     split_message,
 )
 
@@ -451,3 +456,112 @@ def test_alert_deduplication_is_per_group_topic_and_requires_a_real_update() -> 
         EventDecision(True, "high", "服务中断", "支付服务中断", "正在抢修", True),
         now + ALERT_TOPIC_COOLDOWN + dt.timedelta(minutes=1),
     )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("@daily_bot /qd", True),
+        ("/checkin", True),
+        ("@daily_bot 签到", True),
+        ("怎么签到？", False),
+        ("签到成功，获得积分", False),
+        ("这是签到教程", False),
+        ("今天群里有人签到", False),
+    ],
+)
+def test_checkin_suggestion_candidates_require_an_actual_action(text: str, expected: bool) -> None:
+    assert _is_checkin_suggestion_candidate(text) is expected
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_includes_source_bot_reply_and_ai_reason(monkeypatch) -> None:
+    state: dict[str, str] = {}
+    sent: list[tuple[int, str, dict]] = []
+
+    class Archive:
+        def get_state(self, key):
+            return state.get(key)
+
+        def set_state(self, key, value):
+            state[key] = value
+
+    class LLM:
+        async def assess_checkin_suggestion(self, *args):
+            assert args[3:] == ("@daily_bot /qd", "签到成功，获得 1 积分")
+            return CheckinSuggestionDecision(
+                True, "high", "用户命令已获 Bot 成功确认", "@daily_bot /qd"
+            )
+
+    class Bot:
+        async def send_message(self, target, text, **kwargs):
+            sent.append((target, text, kwargs))
+
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(summary_target=5361150559, timezone="Asia/Shanghai")
+    service.archive = Archive()
+    service.llm = LLM()
+    service.bot = Bot()
+    service._checkin_suggestion_days = set()
+    service._checkin_suggestion_candidates = {
+        (-1001, 7): CheckinSuggestionCandidate(
+            chat_id=-1001,
+            message_id=7,
+            source_name="签到群",
+            source_username="daily_group",
+            source_sender="Alice",
+            source_time=dt.datetime(2026, 8, 19, tzinfo=dt.timezone.utc),
+            source_text="@daily_bot /qd",
+            bot_reply="签到成功，获得 1 积分",
+        )
+    }
+    service._checkin_configs = lambda: {}
+    monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
+
+    await service._analyze_checkin_suggestion((-1001, 7))
+
+    assert len(sent) == 1
+    _, notification, kwargs = sent[0]
+    assert "源消息" in notification and "@daily_bot /qd" in notification
+    assert "Bot 回复：签到成功，获得 1 积分" in notification
+    assert "AI 判断（高置信）：用户命令已获 Bot 成功确认" in notification
+    assert "https://t.me/daily_group/7" in notification
+    assert kwargs["buttons"]
+    saved = json.loads(state["checkin_suggestions"])
+    assert saved["-1001"]["text"] == "@daily_bot /qd"
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_requires_a_direct_bot_reply(monkeypatch) -> None:
+    class LLM:
+        async def assess_checkin_suggestion(self, *_args):
+            raise AssertionError("AI must not run without bot evidence")
+
+    service = object.__new__(TelegramInsightService)
+    service.llm = LLM()
+    service._checkin_suggestion_candidates = {
+        (-1001, 7): CheckinSuggestionCandidate(
+            -1001, 7, "签到群", None, "Alice", dt.datetime.now(dt.timezone.utc), "/qd"
+        )
+    }
+    monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
+
+    await service._analyze_checkin_suggestion((-1001, 7))
+
+
+def test_checkin_suggestion_only_associates_a_direct_bot_reply() -> None:
+    candidate = CheckinSuggestionCandidate(
+        -1001, 7, "签到群", None, "Alice", dt.datetime.now(dt.timezone.utc), "/qd"
+    )
+    service = object.__new__(TelegramInsightService)
+    service._checkin_suggestion_candidates = {(-1001, 7): candidate}
+
+    service._record_checkin_suggestion_bot_reply(
+        SimpleNamespace(chat_id=-1001, message=SimpleNamespace(reply_to_msg_id=6)), "签到成功"
+    )
+    assert not candidate.bot_reply
+
+    service._record_checkin_suggestion_bot_reply(
+        SimpleNamespace(chat_id=-1001, message=SimpleNamespace(reply_to_msg_id=7)), "签到成功"
+    )
+    assert candidate.bot_reply == "签到成功"

@@ -17,6 +17,7 @@ from .config import Settings
 from .database import Archive, StoredMessage
 from .llm import (
     CONTENT_CATEGORIES,
+    CheckinSuggestionDecision,
     EventDecision,
     InsightLLM,
     limit_summary_messages,
@@ -49,6 +50,7 @@ CHECKIN_REPORT_STATE = "last_checkin_report_day"
 CHECKIN_REPORT_ENABLED_STATE = "checkin_report_enabled"
 CHECKIN_ALERT_STATE = "checkin_alerts"
 CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
+CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
 CHECKIN_SUCCESS_KEYWORDS = (
     "签到成功",
     "已签到",
@@ -68,6 +70,9 @@ ALERT_KEYWORDS_DEFAULT = "紧急,重要通知,故障,截止,封禁,下架,涨价
 ALERT_CONTEXT_MESSAGES = 12
 ALERT_MAX_MESSAGE_AGE = dt.timedelta(minutes=45)
 ALERT_TOPIC_COOLDOWN = dt.timedelta(minutes=15)
+CHECKIN_COMMAND_PATTERN = re.compile(
+    r"(?<![a-z0-9_])/(?:qd|checkin)(?:@[a-z0-9_]{5,})?(?![a-z0-9_])", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,18 @@ class SourceChat:
 class AlertRecord:
     sent_at: dt.datetime
     new_information: str
+
+
+@dataclass
+class CheckinSuggestionCandidate:
+    chat_id: int
+    message_id: int
+    source_name: str
+    source_username: str | None
+    source_sender: str
+    source_time: dt.datetime
+    source_text: str
+    bot_reply: str = ""
 
 
 @dataclass(frozen=True)
@@ -156,6 +173,8 @@ class TelegramInsightService:
         self._alert_last_sent: dict[tuple[int, str], AlertRecord] = {}
         self._alert_lock = asyncio.Lock()
         self._checkin_suggestion_days: set[tuple[int, str]] = set()
+        self._checkin_suggestion_candidates: dict[tuple[int, int], CheckinSuggestionCandidate] = {}
+        self._checkin_suggestion_tasks: set[asyncio.Task[None]] = set()
         self._user_id: int | None = None
 
     async def run(self) -> None:
@@ -192,9 +211,12 @@ class TelegramInsightService:
                 task.cancel()
             for task in self._alert_tasks:
                 task.cancel()
+            for task in self._checkin_suggestion_tasks:
+                task.cancel()
             await asyncio.gather(*self._backfill_tasks, return_exceptions=True)
             await asyncio.gather(*self._classification_tasks, return_exceptions=True)
             await asyncio.gather(*self._alert_tasks, return_exceptions=True)
+            await asyncio.gather(*self._checkin_suggestion_tasks, return_exceptions=True)
             await self.user.disconnect()
             await self.bot.disconnect()
 
@@ -1403,34 +1425,123 @@ class TelegramInsightService:
         if source is None or not text or len(text) > MAX_CHECKIN_TEXT_LENGTH:
             return
         sender = getattr(getattr(event, "message", None), "sender", None)
-        if getattr(sender, "bot", False) or getattr(sender, "id", None) == self._user_id:
+        if sender is None:
+            sender = getattr(event, "sender", None)
+        if getattr(sender, "bot", False):
+            self._record_checkin_suggestion_bot_reply(event, text)
             return
-        lowered = text.casefold()
-        if not any(token in lowered for token in ("/checkin", "签到", "打卡", "签到一下")):
+        if getattr(sender, "id", None) == self._user_id:
             return
-        if any(token in lowered for token in ("签到成功", "已签到", "签到完成")):
+        if not _is_checkin_suggestion_candidate(text):
             return
         day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
         key = (int(chat_id), day)
         if key in self._checkin_suggestion_days or int(chat_id) in self._checkin_configs():
             return
-        self._checkin_suggestion_days.add(key)
+        message = getattr(event, "message", None)
+        message_id = getattr(message, "id", None)
+        if not isinstance(message_id, int):
+            return
+        candidate_key = (int(chat_id), message_id)
+        if candidate_key in self._checkin_suggestion_candidates:
+            return
+        source_time = _event_message_time(event)
+        self._checkin_suggestion_candidates[candidate_key] = CheckinSuggestionCandidate(
+            chat_id=int(chat_id),
+            message_id=message_id,
+            source_name=source.name,
+            source_username=source.username,
+            source_sender=_sender_name(sender),
+            source_time=source_time,
+            source_text=text,
+        )
+        task = asyncio.create_task(
+            self._analyze_checkin_suggestion(candidate_key), name="checkin-suggestion"
+        )
+        self._checkin_suggestion_tasks.add(task)
+        task.add_done_callback(self._checkin_suggestion_tasks.discard)
+
+    def _record_checkin_suggestion_bot_reply(self, event: Any, text: str) -> None:
+        message = getattr(event, "message", None)
+        reply_to = getattr(message, "reply_to_msg_id", None)
+        chat_id = getattr(event, "chat_id", None)
+        if not isinstance(chat_id, int) or not isinstance(reply_to, int):
+            return
+        candidate = self._checkin_suggestion_candidates.get((chat_id, reply_to))
+        if candidate is not None and not candidate.bot_reply:
+            candidate.bot_reply = text[:MAX_CHECKIN_TEXT_LENGTH]
+
+    async def _analyze_checkin_suggestion(self, candidate_key: tuple[int, int]) -> None:
+        try:
+            await asyncio.sleep(CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS)
+            candidate = self._checkin_suggestion_candidates.pop(candidate_key, None)
+            if candidate is None or not candidate.bot_reply:
+                return
+            day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
+            key = (candidate.chat_id, day)
+            if key in self._checkin_suggestion_days or candidate.chat_id in self._checkin_configs():
+                return
+            decision = await self.llm.assess_checkin_suggestion(
+                candidate.source_name,
+                candidate.source_sender,
+                candidate.source_time,
+                candidate.source_text,
+                candidate.bot_reply,
+            )
+            if not decision.should_suggest or not _is_literal_checkin_proposal(
+                decision.proposed_text, candidate.source_text
+            ):
+                return
+            self._checkin_suggestion_days.add(key)
+            self._save_checkin_suggestion(candidate, decision, day)
+            source_link = _telegram_message_link(
+                candidate.chat_id, candidate.source_username, candidate.message_id
+            )
+            stamp = candidate.source_time.astimezone(ZoneInfo(self.settings.timezone)).strftime(
+                "%Y-%m-%d %H:%M %Z"
+            )
+            await self.bot.send_message(
+                self.settings.summary_target,
+                (
+                    "检测到可复用的签到操作，请确认是否部署。\n"
+                    f"群组：{candidate.source_name}\n"
+                    f"源消息（{stamp}，{candidate.source_sender}）：{candidate.source_text[:300]}\n"
+                    f"Bot 回复：{candidate.bot_reply[:500]}\n"
+                    f"AI 判断（高置信）：{decision.reason}\n"
+                    f"建议自动发送：{decision.proposed_text}"
+                    + (f"\n来源链接：{source_link}" if source_link else "")
+                ),
+                buttons=[
+                    [
+                        Button.inline("同意并部署", data=f"ks:{candidate.chat_id}".encode()),
+                        Button.inline("忽略", data=f"ki:{candidate.chat_id}".encode()),
+                    ]
+                ],
+                link_preview=False,
+            )
+        except Exception:
+            log.exception("Check-in suggestion analysis failed for candidate=%s", candidate_key)
+
+    def _save_checkin_suggestion(
+        self, candidate: CheckinSuggestionCandidate, decision: CheckinSuggestionDecision, day: str
+    ) -> None:
+        try:
+            saved = json.loads(self.archive.get_state(CHECKIN_SUGGESTION_STATE) or "{}")
+        except json.JSONDecodeError:
+            saved = {}
+        if not isinstance(saved, dict):
+            saved = {}
+        saved[str(candidate.chat_id)] = {
+            "day": day,
+            "text": decision.proposed_text,
+            "source_message_id": candidate.message_id,
+            "source_text": candidate.source_text[:300],
+            "bot_reply": candidate.bot_reply[:500],
+            "reason": decision.reason,
+        }
         self.archive.set_state(
             CHECKIN_SUGGESTION_STATE,
-            json.dumps({str(chat_id): {"day": day, "text": text[:300]}}, ensure_ascii=False),
-        )
-        await self.bot.send_message(
-            self.settings.summary_target,
-            f"发现群组“{source.name}”有人发起签到。\n"
-            f"要为该群部署每天 {DEFAULT_CHECKIN_HOUR:02d}:{DEFAULT_CHECKIN_MINUTE:02d} 的自动签到吗？\n"
-            f"拟发送文本：{text[:300]}",
-            buttons=[
-                [
-                    Button.inline("同意并部署", data=f"ks:{chat_id}".encode()),
-                    Button.inline("忽略", data=f"ki:{chat_id}".encode()),
-                ]
-            ],
-            link_preview=False,
+            json.dumps(saved, ensure_ascii=False),
         )
 
     async def _notify_checkin_failure(self, chat_id: int, detail: str) -> None:
@@ -2011,6 +2122,45 @@ def _alert_detail_fingerprint(value: str) -> str:
 
 def _alert_priority_label(priority: str) -> str:
     return {"critical": "紧急", "high": "重要"}.get(priority, "重要")
+
+
+def _is_checkin_suggestion_candidate(text: str) -> bool:
+    normalized = " ".join(text.casefold().split())
+    if not normalized or any(
+        marker in normalized
+        for marker in (
+            "签到成功",
+            "已签到",
+            "签到完成",
+            "签到失败",
+            "怎么签到",
+            "如何签到",
+            "签到教程",
+            "签到规则",
+        )
+    ):
+        return False
+    if CHECKIN_COMMAND_PATTERN.search(normalized):
+        return True
+    has_bot_mention = bool(re.search(r"@[a-z][a-z0-9_]{4,}", normalized, re.IGNORECASE))
+    return has_bot_mention and any(word in normalized for word in ("签到", "打卡"))
+
+
+def _is_literal_checkin_proposal(proposed_text: str, source_text: str) -> bool:
+    proposal = " ".join(proposed_text.split())
+    source = " ".join(source_text.split())
+    if not proposal or len(proposal) > MAX_CHECKIN_TEXT_LENGTH:
+        return False
+    return proposal.casefold() in source.casefold()
+
+
+def _telegram_message_link(chat_id: int, username: str | None, message_id: int) -> str | None:
+    if username:
+        return f"https://t.me/{username.lstrip('@')}/{message_id}"
+    raw = str(abs(chat_id))
+    if raw.startswith("100"):
+        return f"https://t.me/c/{raw[3:]}/{message_id}"
+    return None
 
 
 def _parse_alert_keywords(value: Any) -> tuple[str, ...]:
