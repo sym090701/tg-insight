@@ -38,6 +38,9 @@ from tg_insight.service import (
     _state_int_in_range,
     _summary_excluded,
     _is_checkin_suggestion_candidate,
+    _checkin_suggestion_retry_delay,
+    _checkin_suggestion_expired,
+    _checkin_status_available,
     split_message,
 )
 
@@ -475,6 +478,46 @@ def test_checkin_suggestion_candidates_require_an_actual_action(text: str, expec
     assert _is_checkin_suggestion_candidate(text) is expected
 
 
+def test_checkin_suggestion_retry_delay_is_bounded() -> None:
+    assert _checkin_suggestion_retry_delay(0) == 30
+    assert _checkin_suggestion_retry_delay(1) == 60
+    assert _checkin_suggestion_retry_delay(10) == 15 * 60
+    assert _checkin_suggestion_retry_delay(99) == 15 * 60
+
+
+def test_checkin_suggestion_expiration_uses_utc() -> None:
+    now = dt.datetime.now(dt.timezone.utc)
+    assert not _checkin_suggestion_expired(now - dt.timedelta(hours=23))
+    assert _checkin_suggestion_expired(now - dt.timedelta(hours=25))
+
+
+def test_checkin_status_uses_configured_primary_or_fallback_model() -> None:
+    generated_at = dt.datetime.now(dt.timezone.utc).timestamp()
+    payload = {
+        "generated_at": generated_at,
+        "services": [
+            {"model": "gpt-5.6-luna", "last": {"ok": False}},
+            {"model": "gpt-5.6-terra", "last": {"ok": True}},
+        ]
+    }
+    assert _checkin_status_available(payload, ("gpt-5.6-luna", "gpt-5.6-terra")) is True
+    assert _checkin_status_available(
+        {
+            "generated_at": generated_at,
+            "services": [{"model": "gpt-5.6-luna", "last": {"ok": False}}],
+        },
+        ("gpt-5.6-luna",),
+    ) is False
+    assert _checkin_status_available({"invalid": []}, ("gpt-5.6-luna",)) is None
+    assert _checkin_status_available(
+        {
+            "generated_at": generated_at - 3600,
+            "services": [{"model": "gpt-5.6-luna", "last": {"ok": False}}],
+        },
+        ("gpt-5.6-luna",),
+    ) is None
+
+
 @pytest.mark.asyncio
 async def test_checkin_suggestion_includes_source_bot_reply_and_ai_reason(monkeypatch) -> None:
     state: dict[str, str] = {}
@@ -511,7 +554,7 @@ async def test_checkin_suggestion_includes_source_bot_reply_and_ai_reason(monkey
             source_name="签到群",
             source_username="daily_group",
             source_sender="Alice",
-            source_time=dt.datetime(2026, 8, 19, tzinfo=dt.timezone.utc),
+            source_time=dt.datetime.now(dt.timezone.utc),
             source_text="@daily_bot /qd",
             bot_reply="签到成功，获得 1 积分",
         )
@@ -548,6 +591,104 @@ async def test_checkin_suggestion_requires_a_direct_bot_reply(monkeypatch) -> No
     monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
 
     await service._analyze_checkin_suggestion((-1001, 7))
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_keeps_candidate_after_temporary_ai_failure(monkeypatch) -> None:
+    state: dict[str, str] = {}
+    calls = 0
+
+    class Archive:
+        def get_state(self, key):
+            return state.get(key)
+
+        def set_state(self, key, value):
+            state[key] = value
+
+    class LLM:
+        async def assess_checkin_suggestion(self, *_args):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise TemporaryAIError()
+            return CheckinSuggestionDecision(True, "high", "确认", "/qd")
+
+    class TemporaryAIError(Exception):
+        status_code = 503
+
+    sent: list[str] = []
+
+    class Bot:
+        async def send_message(self, _target, text, **_kwargs):
+            sent.append(text)
+
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(
+        summary_target=5361150559,
+        timezone="Asia/Shanghai",
+        llm_model="gpt-5.6-luna",
+        llm_fallback_model="gpt-5.6-terra",
+    )
+    service.archive = Archive()
+    service.llm = LLM()
+    service.bot = Bot()
+    service._checkin_suggestion_days = set()
+    service._checkin_suggestion_candidates = {
+        (-1001, 7): CheckinSuggestionCandidate(
+            -1001, 7, "签到群", "daily_group", "Alice", dt.datetime.now(dt.timezone.utc), "/qd", "签到成功"
+        )
+    }
+    service._checkin_configs = lambda: {}
+    service._checkin_suggestion_ignored = lambda *_args: False
+    status = iter((False, False))
+
+    async def unavailable():
+        return next(status)
+
+    service._checkin_ai_unavailable = unavailable
+    delays = iter((0, 0, 0))
+    monkeypatch.setattr("tg_insight.service._checkin_suggestion_retry_delay", lambda _attempt: next(delays))
+    monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
+
+    await service._analyze_checkin_suggestion((-1001, 7))
+
+    assert calls == 2
+    assert len(sent) == 1
+    assert (-1001, 7) not in service._checkin_suggestion_candidates
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_status_unavailable_does_not_call_ai(monkeypatch) -> None:
+    class LLM:
+        async def assess_checkin_suggestion(self, *_args):
+            raise AssertionError("AI should not be called while status reports all models down")
+
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(
+        timezone="Asia/Shanghai",
+        llm_model="gpt-5.6-luna",
+        llm_fallback_model="gpt-5.6-terra",
+    )
+    service.llm = LLM()
+    service._checkin_suggestion_candidates = {
+        (-1001, 7): CheckinSuggestionCandidate(
+            -1001, 7, "签到群", None, "Alice", dt.datetime.now(dt.timezone.utc), "/qd", "签到成功"
+        )
+    }
+    service._checkin_configs = lambda: {}
+    service._checkin_suggestion_ignored = lambda *_args: False
+    monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
+    monkeypatch.setattr("tg_insight.service._checkin_suggestion_retry_delay", lambda _attempt: 0)
+
+    async def unavailable():
+        return True
+
+    service._checkin_ai_unavailable = unavailable
+    task = asyncio.create_task(service._analyze_checkin_suggestion((-1001, 7)))
+    await asyncio.sleep(0)
+    assert (-1001, 7) in service._checkin_suggestion_candidates
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 def test_checkin_suggestion_only_associates_a_direct_bot_reply() -> None:

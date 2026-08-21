@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from telethon import Button, TelegramClient, events, functions, types
 
 from .config import Settings
@@ -52,6 +53,12 @@ CHECKIN_ALERT_STATE = "checkin_alerts"
 CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
 CHECKIN_SUGGESTION_IGNORES_STATE = "checkin_suggestion_ignores"
 CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
+CHECKIN_SUGGESTION_STATUS_URL = "https://status.input.im/api/status"
+CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS = 8
+CHECKIN_SUGGESTION_STATUS_MAX_AGE_SECONDS = 15 * 60
+CHECKIN_SUGGESTION_RETRY_INITIAL_SECONDS = 30
+CHECKIN_SUGGESTION_RETRY_MAX_SECONDS = 15 * 60
+CHECKIN_SUGGESTION_MAX_AGE = dt.timedelta(hours=24)
 CHECKIN_SUCCESS_KEYWORDS = (
     "签到成功",
     "已签到",
@@ -1486,61 +1493,127 @@ class TelegramInsightService:
     async def _analyze_checkin_suggestion(self, candidate_key: tuple[int, int]) -> None:
         try:
             await asyncio.sleep(CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS)
-            candidate = self._checkin_suggestion_candidates.pop(candidate_key, None)
-            if candidate is None or not candidate.bot_reply:
-                return
-            day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
-            key = (candidate.chat_id, day)
-            if (
-                key in self._checkin_suggestion_days
-                or candidate.chat_id in self._checkin_configs()
-                or self._checkin_suggestion_ignored(candidate.chat_id, dt.date.fromisoformat(day))
-            ):
-                return
-            decision = await self.llm.assess_checkin_suggestion(
-                candidate.source_name,
-                candidate.source_sender,
-                candidate.source_time,
-                candidate.source_text,
-                candidate.bot_reply,
-            )
-            if not decision.should_suggest or not _is_literal_checkin_proposal(
-                decision.proposed_text, candidate.source_text
-            ):
-                return
-            self._checkin_suggestion_days.add(key)
-            self._save_checkin_suggestion(candidate, decision, day)
-            source_link = _telegram_message_link(
-                candidate.chat_id, candidate.source_username, candidate.message_id
-            )
-            stamp = candidate.source_time.astimezone(ZoneInfo(self.settings.timezone)).strftime(
-                "%Y-%m-%d %H:%M %Z"
-            )
-            await self.bot.send_message(
-                self.settings.summary_target,
-                (
-                    "检测到可复用的签到操作，请确认是否部署。\n"
-                    f"群组：{candidate.source_name}\n"
-                    f"源消息（{stamp}，{candidate.source_sender}）：{candidate.source_text[:300]}\n"
-                    f"Bot 回复：{candidate.bot_reply[:500]}\n"
-                    f"AI 判断（高置信）：{decision.reason}\n"
-                    f"建议自动发送：{decision.proposed_text}"
-                    + (f"\n来源链接：{source_link}" if source_link else "")
-                ),
-                buttons=[
-                    [
-                        Button.inline("同意并部署", data=f"ks:{candidate.chat_id}".encode()),
-                        Button.inline("今天忽略", data=f"ki:{candidate.chat_id}".encode()),
+            attempt = 0
+            while True:
+                candidate = self._checkin_suggestion_candidates.get(candidate_key)
+                if candidate is None or not candidate.bot_reply:
+                    self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    return
+                if _checkin_suggestion_expired(candidate.source_time):
+                    self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    log.info("Dropping expired check-in suggestion candidate=%s", candidate_key)
+                    return
+                day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
+                key = (candidate.chat_id, day)
+                if (
+                    key in self._checkin_suggestion_days
+                    or candidate.chat_id in self._checkin_configs()
+                    or self._checkin_suggestion_ignored(candidate.chat_id, dt.date.fromisoformat(day))
+                ):
+                    self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    return
+
+                # The public status probe is only a back-pressure signal. An unknown or
+                # stale probe must never discard evidence; the real API remains authoritative.
+                if await self._checkin_ai_unavailable():
+                    delay = _checkin_suggestion_retry_delay(attempt)
+                    attempt += 1
+                    log.warning(
+                        "Configured AI models are unavailable according to status.input.im; "
+                        "retrying check-in candidate=%s in %ss",
+                        candidate_key,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                try:
+                    decision = await self.llm.assess_checkin_suggestion(
+                        candidate.source_name,
+                        candidate.source_sender,
+                        candidate.source_time,
+                        candidate.source_text,
+                        candidate.bot_reply,
+                    )
+                except Exception as exc:
+                    if not _is_retryable_checkin_ai_error(exc):
+                        self._checkin_suggestion_candidates.pop(candidate_key, None)
+                        log.exception("Check-in suggestion analysis failed permanently for candidate=%s", candidate_key)
+                        return
+                    delay = _checkin_suggestion_retry_delay(attempt)
+                    attempt += 1
+                    log.warning(
+                        "Temporary AI failure for check-in candidate=%s; retrying in %ss: %s",
+                        candidate_key,
+                        delay,
+                        _safe_error(exc),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                self._checkin_suggestion_candidates.pop(candidate_key, None)
+                if not decision.should_suggest or not _is_literal_checkin_proposal(
+                    decision.proposed_text, candidate.source_text
+                ):
+                    return
+                self._checkin_suggestion_days.add(key)
+                self._save_checkin_suggestion(candidate, decision, day)
+                source_link = _telegram_message_link(
+                    candidate.chat_id, candidate.source_username, candidate.message_id
+                )
+                stamp = candidate.source_time.astimezone(ZoneInfo(self.settings.timezone)).strftime(
+                    "%Y-%m-%d %H:%M %Z"
+                )
+                await self.bot.send_message(
+                    self.settings.summary_target,
+                    (
+                        "检测到可复用的签到操作，请确认是否部署。\n"
+                        f"群组：{candidate.source_name}\n"
+                        f"源消息（{stamp}，{candidate.source_sender}）：{candidate.source_text[:300]}\n"
+                        f"Bot 回复：{candidate.bot_reply[:500]}\n"
+                        f"AI 判断（高置信）：{decision.reason}\n"
+                        f"建议自动发送：{decision.proposed_text}"
+                        + (f"\n来源链接：{source_link}" if source_link else "")
+                    ),
+                    buttons=[
+                        [
+                            Button.inline("同意并部署", data=f"ks:{candidate.chat_id}".encode()),
+                            Button.inline("今天忽略", data=f"ki:{candidate.chat_id}".encode()),
+                        ],
+                        [
+                            Button.inline("7 天忽略", data=f"k7:{candidate.chat_id}".encode()),
+                            Button.inline("永久忽略", data=f"kx:{candidate.chat_id}".encode()),
+                        ],
                     ],
-                    [
-                        Button.inline("7 天忽略", data=f"k7:{candidate.chat_id}".encode()),
-                        Button.inline("永久忽略", data=f"kx:{candidate.chat_id}".encode()),
-                    ],
-                ],
-                link_preview=False,
-            )
+                    link_preview=False,
+                )
+                return
         except Exception:
             log.exception("Check-in suggestion analysis failed for candidate=%s", candidate_key)
+
+    async def _checkin_ai_unavailable(self) -> bool:
+        primary_model = getattr(self.settings, "llm_model", "")
+        if not primary_model:
+            return False
+        models = [primary_model]
+        fallback_model = getattr(self.settings, "llm_fallback_model", None)
+        if fallback_model:
+            models.append(fallback_model)
+        try:
+            timeout = aiohttp.ClientTimeout(total=CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    CHECKIN_SUGGESTION_STATUS_URL,
+                    headers={"Accept": "application/json"},
+                ) as response:
+                    if response.status != 200:
+                        return False
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            log.warning("Unable to read AI status source: %s", _safe_error(exc))
+            return False
+        available = _checkin_status_available(payload, models)
+        return available is False
 
     def _save_checkin_suggestion(
         self, candidate: CheckinSuggestionCandidate, decision: CheckinSuggestionDecision, day: str
@@ -2202,6 +2275,63 @@ def _is_literal_checkin_proposal(proposed_text: str, source_text: str) -> bool:
     if not proposal or len(proposal) > MAX_CHECKIN_TEXT_LENGTH:
         return False
     return proposal.casefold() in source.casefold()
+
+
+def _checkin_suggestion_retry_delay(attempt: int) -> int:
+    """Return a bounded delay so an unavailable provider cannot cause a busy loop."""
+    return min(
+        CHECKIN_SUGGESTION_RETRY_MAX_SECONDS,
+        CHECKIN_SUGGESTION_RETRY_INITIAL_SECONDS * (2 ** min(max(attempt, 0), 10)),
+    )
+
+
+def _checkin_status_available(payload: Any, models: Sequence[str]) -> bool | None:
+    """Parse status.input.im without treating unknown/malformed data as an outage."""
+    if not isinstance(payload, dict):
+        return None
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, (int, float)):
+        return None
+    age = dt.datetime.now(dt.timezone.utc).timestamp() - generated_at
+    if age < -300 or age > CHECKIN_SUGGESTION_STATUS_MAX_AGE_SECONDS:
+        return None
+    services = payload.get("services") if isinstance(payload, dict) else None
+    if not isinstance(services, list):
+        return None
+    by_model = {
+        str(item.get("model")): item
+        for item in services
+        if isinstance(item, dict) and item.get("model")
+    }
+    known = [by_model[model] for model in models if model in by_model]
+    if not known:
+        return None
+    return any(
+        isinstance(item.get("last"), dict) and item["last"].get("ok") is True
+        for item in known
+    )
+
+
+def _checkin_suggestion_expired(source_time: dt.datetime) -> bool:
+    now = dt.datetime.now(dt.timezone.utc)
+    timestamp = source_time
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(dt.timezone.utc)
+    return now - timestamp > CHECKIN_SUGGESTION_MAX_AGE
+
+
+def _is_retryable_checkin_ai_error(exc: Exception) -> bool:
+    """Retry only transient provider failures; auth and malformed responses fail closed."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 425, 429} or status_code >= 500
+    name = type(exc).__name__.lower()
+    return any(
+        marker in name
+        for marker in ("connection", "timeout", "temporarilyunavailable", "ratelimit")
+    )
 
 
 def _telegram_message_link(chat_id: int, username: str | None, message_id: int) -> str | None:

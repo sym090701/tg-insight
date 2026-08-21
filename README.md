@@ -42,7 +42,13 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   selected for archiving. Unselected groups are not written to the message
   database: their candidate message and Bot reply exist only in memory until the
   decision is sent. Suggested actions can be ignored for today, seven days, or
-  permanently per group.
+  permanently per group. If the configured AI endpoint is temporarily unavailable,
+  a candidate with a direct Bot reply remains in memory and is retried with bounded
+  exponential backoff (30 seconds up to 15 minutes). The service checks
+  `https://status.input.im/api/status` before retries when possible, but treats the
+  actual API response as authoritative; malformed or unreachable status data never
+  discards evidence. Candidates older than 24 hours expire automatically, and a
+  successful suggestion is sent at most once per group per day.
 - `/alerts` enables major-event alerts. Keywords are only candidate signals: AI
   verifies the target message against its timestamp and recent same-group context,
   ignores stale forwards and ordinary discussion, and suppresses repeated topics
