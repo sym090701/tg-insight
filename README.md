@@ -71,9 +71,6 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   common API keys, Bot tokens, hashes, email addresses, phone numbers, and IP
   addresses are replaced in the model-only copy. Local SQLite records and Telegram
   notifications retain the original source text.
-- `/retention` sets a per-group message retention period from 1 to 3650 days;
-  unlisted groups use the global retention setting. `/status` also reports the
-  number of LLM requests, failures, and average latency since the service started.
 - LLM prompts treat all Telegram content as untrusted data and cannot perform Telegram actions.
 - Archive size, free disk reserve, digest input, and automatic retries have hard limits.
 
@@ -109,7 +106,6 @@ Only IDs in `TG_ALLOWED_USER_IDS` can use the bot.
 /checkin          Add a group/Bot, configure text/time/Topic, history, toggle, or run now
 /alerts           Configure major-event alert switch and keywords
 /topics           Configure per-group keyword subscriptions
-/retention        Configure per-group message retention
 /refresh          Refresh joined groups and Bot targets
 /backup           Export a consistent SQLite archive backup to the private Bot chat
 /status           Show archive size, source chats, schedule, and model

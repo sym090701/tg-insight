@@ -263,20 +263,6 @@ class Archive:
                 conn.execute("PRAGMA incremental_vacuum(1000)")
             return cursor.rowcount
 
-    def prune_chat(self, chat_id: int, retention_days: int) -> int:
-        if retention_days <= 0:
-            return 0
-        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=retention_days)
-        with self.connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM messages WHERE chat_id=? AND sent_at < ?",
-                (chat_id, _utc_iso(cutoff)),
-            )
-            self._message_count = max(0, self._current_count(conn) - cursor.rowcount)
-            if cursor.rowcount:
-                conn.execute("PRAGMA incremental_vacuum(1000)")
-            return cursor.rowcount
-
     def _current_count(self, conn: sqlite3.Connection) -> int:
         if self._message_count is None:
             self._message_count = int(

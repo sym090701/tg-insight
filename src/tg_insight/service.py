@@ -58,10 +58,6 @@ CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
 CHECKIN_SUGGESTION_IGNORES_STATE = "checkin_suggestion_ignores"
 TOPIC_SUBSCRIPTIONS_STATE = "topic_subscriptions"
 DIGEST_CURSORS_STATE = "digest_cursors"
-RETENTION_OVERRIDES_STATE = "retention_overrides"
-DEFAULT_GROUP_RETENTION_DAYS = 730
-MIN_GROUP_RETENTION_DAYS = 1
-MAX_GROUP_RETENTION_DAYS = 3650
 CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
 CHECKIN_SUGGESTION_STATUS_URL = "https://status.input.im/api/status"
 CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS = 8
@@ -189,7 +185,6 @@ class TelegramInsightService:
         self._pending_checkin_topic_users: dict[int, int] = {}
         self._pending_alert_keywords_users: set[int] = set()
         self._pending_topic_users: dict[int, int] = {}
-        self._pending_retention_users: set[int] = set()
         self._checkin_waiters: dict[tuple[int, str], asyncio.Future[tuple[str, str]]] = {}
         self._refresh_lock = asyncio.Lock()
         self._alert_tasks: set[asyncio.Task[None]] = set()
@@ -384,7 +379,6 @@ class TelegramInsightService:
         self.bot.add_event_handler(self._on_refresh, events.NewMessage(pattern=r"^/refresh$"))
         self.bot.add_event_handler(self._on_alerts, events.NewMessage(pattern=r"^/alerts$"))
         self.bot.add_event_handler(self._on_topics, events.NewMessage(pattern=r"^/topics$"))
-        self.bot.add_event_handler(self._on_retention, events.NewMessage(pattern=r"^/retention$"))
         self.bot.add_event_handler(self._on_backup, events.NewMessage(pattern=r"^/backup$"))
         self.bot.add_event_handler(self._on_ask, events.NewMessage(pattern=r"^/ask(?:\s+(.+))?$"))
         self.bot.add_event_handler(self._on_groups, events.NewMessage(pattern=r"^/groups$"))
@@ -471,7 +465,6 @@ class TelegramInsightService:
             "/checkin - 管理自动签到\n"
             "/alerts - 配置重大事件提醒\n"
             "/topics - 管理关键词话题订阅\n"
-            "/retention - 设置单群消息保留天数\n"
             "/refresh - 重新扫描群组和机器人\n"
             "/backup - 导出不含凭据的消息数据库\n"
             "/settings - 设置每日推送时间和开关\n"
@@ -507,7 +500,6 @@ class TelegramInsightService:
             f"自动签到：{enabled_checkins}/{len(checkins)} 个群已开启\n"
             f"重大事件提醒：{'开启' if alert_enabled else '关闭'}\n"
             f"话题订阅：{len(self._topic_subscriptions())} 个\n"
-            f"AI 请求：{self._llm_metrics_text()}\n"
             f"AI 模型：{self.settings.llm_model}"
             + (
                 f"（备用：{self.settings.llm_fallback_model}）"
@@ -564,16 +556,6 @@ class TelegramInsightService:
             return
         text, buttons = self._topics_picker()
         await event.reply(text, buttons=buttons)
-
-    async def _on_retention(self, event: Any) -> None:
-        if not await self._private_authorized(event):
-            return
-        self._pending_retention_users.add(event.sender_id)
-        lines = ["单群消息保留天数", "发送：群组 ID,天数（1-3650）", "未设置的群组使用全局默认值。"]
-        for chat_id, days in sorted(self._retention_overrides().items()):
-            source = self.available_sources.get(chat_id)
-            lines.append(f"- {source.name if source else chat_id}：{days} 天")
-        await event.reply("\n".join(lines))
 
     async def _on_backup(self, event: Any) -> None:
         if not await self._private_authorized(event):
@@ -641,31 +623,6 @@ class TelegramInsightService:
             if keyword:
                 result.append({"chat_id": chat_id, "keyword": keyword, "last_sent": str(item.get("last_sent", ""))})
         return result
-
-    def _retention_overrides(self) -> dict[int, int]:
-        try:
-            raw = json.loads(self.archive.get_state(RETENTION_OVERRIDES_STATE) or "{}")
-        except json.JSONDecodeError:
-            return {}
-        if not isinstance(raw, dict):
-            return {}
-        values: dict[int, int] = {}
-        for key, value in raw.items():
-            try:
-                chat_id, days = int(key), int(value)
-            except (TypeError, ValueError):
-                continue
-            if MIN_GROUP_RETENTION_DAYS <= days <= MAX_GROUP_RETENTION_DAYS:
-                values[chat_id] = days
-        return values
-
-    def _llm_metrics_text(self) -> str:
-        metrics = getattr(self.llm, "metrics", {})
-        requests = int(metrics.get("requests", 0))
-        failures = int(metrics.get("failures", 0))
-        latency = float(metrics.get("latency_ms", 0.0))
-        avg = latency / requests if requests else 0.0
-        return f"{requests} 次，失败 {failures} 次，平均 {avg:.0f}ms"
 
     def _save_topic_subscriptions(self, values: Sequence[dict[str, Any]]) -> None:
         self.archive.set_state(TOPIC_SUBSCRIPTIONS_STATE, json.dumps(list(values)[:MAX_TOPIC_SUBSCRIPTIONS], ensure_ascii=False))
@@ -1306,21 +1263,6 @@ class TelegramInsightService:
             )
             self._pending_alert_keywords_users.discard(event.sender_id)
             await event.reply("重大事件提醒关键词已保存。")
-            return
-        if event.sender_id in self._pending_retention_users:
-            raw_chat, raw_days = (item.strip() for item in event.raw_text.split(",", 1))
-            try:
-                chat_id, days = int(raw_chat), int(raw_days)
-            except ValueError:
-                chat_id = days = 0
-            if chat_id in self.available_sources and MIN_GROUP_RETENTION_DAYS <= days <= MAX_GROUP_RETENTION_DAYS:
-                overrides = self._retention_overrides()
-                overrides[chat_id] = days
-                self.archive.set_state(RETENTION_OVERRIDES_STATE, json.dumps({str(k): v for k, v in overrides.items()}))
-                await event.reply(f"已设置该群保留 {days} 天。")
-                self._pending_retention_users.discard(event.sender_id)
-                return
-            await event.reply("格式无效，请发送：群组 ID,天数（1-3650）。")
             return
         chat_id = self._pending_topic_users.get(event.sender_id)
         if chat_id is not None:
@@ -2233,8 +2175,6 @@ class TelegramInsightService:
                     self.archive.set_state("last_digest_day", day_key)
                     self.archive.set_state("digest_retry_at", "")
                     self.archive.prune(self.settings.retention_days)
-                    for chat_id, days in self._retention_overrides().items():
-                        self.archive.prune_chat(chat_id, days)
                 except Exception:
                     log.exception("Scheduled digest failed")
                     self.archive.set_state(
@@ -2337,7 +2277,6 @@ class TelegramInsightService:
                     types.BotCommand(command="checkin", description="管理自动签到"),
                     types.BotCommand(command="alerts", description="配置重大事件提醒"),
                     types.BotCommand(command="topics", description="管理关键词话题订阅"),
-                    types.BotCommand(command="retention", description="设置单群消息保留天数"),
                     types.BotCommand(command="refresh", description="刷新群组和机器人列表"),
                     types.BotCommand(command="backup", description="导出消息数据库备份"),
                     types.BotCommand(command="settings", description="设置每日推送"),
