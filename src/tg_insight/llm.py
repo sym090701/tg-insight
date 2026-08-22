@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -70,18 +71,29 @@ class InsightLLM:
         self.model = model
         self.fallback_model = fallback_model if fallback_model != model else None
         self._request_slots = asyncio.Semaphore(3)
+        self.metrics = {"requests": 0, "failures": 0, "latency_ms": 0.0, "models": {}}
 
     async def _complete(self, messages: list[dict[str, str]], temperature: float):
+        if not hasattr(self, "metrics"):
+            self.metrics = {"requests": 0, "failures": 0, "latency_ms": 0.0, "models": {}}
         async with self._request_slots:
             models = (self.model,) + ((self.fallback_model,) if self.fallback_model else ())
             for index, model in enumerate(models):
                 try:
-                    return await self.client.chat.completions.create(
+                    started = time.monotonic()
+                    self.metrics["requests"] += 1
+                    response = await self.client.chat.completions.create(
                         model=model,
                         messages=messages,
                         temperature=temperature,
                     )
+                    elapsed = (time.monotonic() - started) * 1000
+                    self.metrics["latency_ms"] += elapsed
+                    models_used = self.metrics["models"]
+                    models_used[model] = int(models_used.get(model, 0)) + 1
+                    return response
                 except Exception as exc:
+                    self.metrics["failures"] += 1
                     if index + 1 == len(models) or not _should_use_fallback(exc):
                         raise
                     log.warning("Primary LLM model unavailable; using configured fallback")

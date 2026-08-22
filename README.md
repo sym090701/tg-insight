@@ -12,6 +12,10 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   (Asia/Shanghai) time.
 - Daily summaries rank cross-group, high-information developments first, then give
   a separate intelligence update for every group with archived activity.
+- Scheduled summaries are incremental per group: after a successful scheduled push,
+  each group's cursor advances. A manual `/summary` does not advance cursors, and
+  failed pushes are retried without losing unread messages. A small overlap is kept
+  so ongoing topics can be recognized as updates.
 - Digest records include their precise timestamp and age at analysis time. Older
   messages are not restated as fresh news; they can reappear only as context for a
   genuinely active, recently updated topic, and the summary must describe the new
@@ -56,6 +60,20 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   a consistent SQLite backup and sends it to the authorized user; the seven newest
   backups are retained. The backup contains archived chat history, so treat it as
   sensitive data.
+- `/topics` watches selected archived groups for user-defined keywords and sends a
+  separate AI-verified update with a cooldown. Topic subscriptions work even when
+  broad major-event alerts are disabled. Alert messages provide feedback buttons
+  for marking a topic important or ignoring that topic permanently.
+- Scheduled check-ins track consecutive failure days. After three consecutive failed
+  days, the private notification is explicitly escalated with the target and latest
+  error detail.
+- Before archived messages, event context, or check-in evidence is sent to the LLM,
+  common API keys, Bot tokens, hashes, email addresses, phone numbers, and IP
+  addresses are replaced in the model-only copy. Local SQLite records and Telegram
+  notifications retain the original source text.
+- `/retention` sets a per-group message retention period from 1 to 3650 days;
+  unlisted groups use the global retention setting. `/status` also reports the
+  number of LLM requests, failures, and average latency since the service started.
 - LLM prompts treat all Telegram content as untrusted data and cannot perform Telegram actions.
 - Archive size, free disk reserve, digest input, and automatic retries have hard limits.
 
@@ -90,6 +108,8 @@ Only IDs in `TG_ALLOWED_USER_IDS` can use the bot.
 /content          Classify groups; reanalyze a page or every selected group
 /checkin          Add a group/Bot, configure text/time/Topic, history, toggle, or run now
 /alerts           Configure major-event alert switch and keywords
+/topics           Configure per-group keyword subscriptions
+/retention        Configure per-group message retention
 /refresh          Refresh joined groups and Bot targets
 /backup           Export a consistent SQLite archive backup to the private Bot chat
 /status           Show archive size, source chats, schedule, and model

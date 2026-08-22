@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import json
 import logging
@@ -45,13 +46,22 @@ CHECKIN_OFFSET_MAX_MS = 800
 MAX_CHECKIN_TARGETS = 50
 MAX_CHECKIN_TEXT_LENGTH = 1_000
 CHECKIN_MAX_ATTEMPTS = 3
+CHECKIN_FAILURE_ESCALATION_DAYS = 3
 CHECKIN_VERIFY_TIMEOUT_SECONDS = 8
 CHECKIN_HISTORY_LIMIT = 30
 CHECKIN_REPORT_STATE = "last_checkin_report_day"
 CHECKIN_REPORT_ENABLED_STATE = "checkin_report_enabled"
 CHECKIN_ALERT_STATE = "checkin_alerts"
+ALERT_FEEDBACK_STATE = "alert_feedback"
+ALERT_IGNORED_TOPICS_STATE = "alert_ignored_topics"
 CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
 CHECKIN_SUGGESTION_IGNORES_STATE = "checkin_suggestion_ignores"
+TOPIC_SUBSCRIPTIONS_STATE = "topic_subscriptions"
+DIGEST_CURSORS_STATE = "digest_cursors"
+RETENTION_OVERRIDES_STATE = "retention_overrides"
+DEFAULT_GROUP_RETENTION_DAYS = 730
+MIN_GROUP_RETENTION_DAYS = 1
+MAX_GROUP_RETENTION_DAYS = 3650
 CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
 CHECKIN_SUGGESTION_STATUS_URL = "https://status.input.im/api/status"
 CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS = 8
@@ -78,6 +88,8 @@ ALERT_KEYWORDS_DEFAULT = "紧急,重要通知,故障,截止,封禁,下架,涨价
 ALERT_CONTEXT_MESSAGES = 12
 ALERT_MAX_MESSAGE_AGE = dt.timedelta(minutes=45)
 ALERT_TOPIC_COOLDOWN = dt.timedelta(minutes=15)
+TOPIC_SUBSCRIPTION_COOLDOWN = dt.timedelta(minutes=30)
+MAX_TOPIC_SUBSCRIPTIONS = 20
 CHECKIN_COMMAND_PATTERN = re.compile(
     r"(?<![a-z0-9_])/(?:qd|checkin)(?:@[a-z0-9_]{5,})?(?![a-z0-9_])", re.IGNORECASE
 )
@@ -136,6 +148,7 @@ class CheckinConfig:
     topic_id: int | None = None
     last_status: str = ""
     last_detail: str = ""
+    failure_streak: int = 0
     history: tuple[CheckinRecord, ...] = ()
 
 
@@ -175,10 +188,13 @@ class TelegramInsightService:
         self._pending_checkin_schedule_users: dict[int, int] = {}
         self._pending_checkin_topic_users: dict[int, int] = {}
         self._pending_alert_keywords_users: set[int] = set()
+        self._pending_topic_users: dict[int, int] = {}
+        self._pending_retention_users: set[int] = set()
         self._checkin_waiters: dict[tuple[int, str], asyncio.Future[tuple[str, str]]] = {}
         self._refresh_lock = asyncio.Lock()
         self._alert_tasks: set[asyncio.Task[None]] = set()
         self._alert_last_sent: dict[tuple[int, str], AlertRecord] = {}
+        self._alert_feedback: dict[tuple[int, str], str] = {}
         self._alert_lock = asyncio.Lock()
         self._checkin_suggestion_days: set[tuple[int, str]] = set()
         self._checkin_suggestion_candidates: dict[tuple[int, int], CheckinSuggestionCandidate] = {}
@@ -367,6 +383,8 @@ class TelegramInsightService:
         self.bot.add_event_handler(self._on_checkin, events.NewMessage(pattern=r"^/checkin$"))
         self.bot.add_event_handler(self._on_refresh, events.NewMessage(pattern=r"^/refresh$"))
         self.bot.add_event_handler(self._on_alerts, events.NewMessage(pattern=r"^/alerts$"))
+        self.bot.add_event_handler(self._on_topics, events.NewMessage(pattern=r"^/topics$"))
+        self.bot.add_event_handler(self._on_retention, events.NewMessage(pattern=r"^/retention$"))
         self.bot.add_event_handler(self._on_backup, events.NewMessage(pattern=r"^/backup$"))
         self.bot.add_event_handler(self._on_ask, events.NewMessage(pattern=r"^/ask(?:\s+(.+))?$"))
         self.bot.add_event_handler(self._on_groups, events.NewMessage(pattern=r"^/groups$"))
@@ -374,7 +392,7 @@ class TelegramInsightService:
         self.bot.add_event_handler(
             self._on_group_callback,
             events.CallbackQuery(
-                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx)(?::|$)|(?:s|st|sd)$)"
+                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx|tp|td|ti|af|ro)(?::|$)|(?:s|st|sd)$)"
             ),
         )
         self.bot.add_event_handler(self._on_private_text, events.NewMessage(incoming=True))
@@ -452,6 +470,8 @@ class TelegramInsightService:
             "/content - 识别内容类型并排除成人群摘要\n"
             "/checkin - 管理自动签到\n"
             "/alerts - 配置重大事件提醒\n"
+            "/topics - 管理关键词话题订阅\n"
+            "/retention - 设置单群消息保留天数\n"
             "/refresh - 重新扫描群组和机器人\n"
             "/backup - 导出不含凭据的消息数据库\n"
             "/settings - 设置每日推送时间和开关\n"
@@ -486,6 +506,8 @@ class TelegramInsightService:
             f"每日摘要：{schedule}（{self.settings.timezone}）\n"
             f"自动签到：{enabled_checkins}/{len(checkins)} 个群已开启\n"
             f"重大事件提醒：{'开启' if alert_enabled else '关闭'}\n"
+            f"话题订阅：{len(self._topic_subscriptions())} 个\n"
+            f"AI 请求：{self._llm_metrics_text()}\n"
             f"AI 模型：{self.settings.llm_model}"
             + (
                 f"（备用：{self.settings.llm_fallback_model}）"
@@ -537,6 +559,22 @@ class TelegramInsightService:
         text, buttons = self._alerts_picker()
         await event.reply(text, buttons=buttons)
 
+    async def _on_topics(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        text, buttons = self._topics_picker()
+        await event.reply(text, buttons=buttons)
+
+    async def _on_retention(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        self._pending_retention_users.add(event.sender_id)
+        lines = ["单群消息保留天数", "发送：群组 ID,天数（1-3650）", "未设置的群组使用全局默认值。"]
+        for chat_id, days in sorted(self._retention_overrides().items()):
+            source = self.available_sources.get(chat_id)
+            lines.append(f"- {source.name if source else chat_id}：{days} 天")
+        await event.reply("\n".join(lines))
+
     async def _on_backup(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
@@ -581,6 +619,86 @@ class TelegramInsightService:
             [Button.inline("修改关键词", data=b"kb")],
         ]
 
+    def _topic_subscriptions(self) -> list[dict[str, Any]]:
+        archive = getattr(self, "archive", None)
+        if archive is None or not hasattr(archive, "get_state"):
+            return []
+        try:
+            raw = json.loads(archive.get_state(TOPIC_SUBSCRIPTIONS_STATE) or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for item in raw[:MAX_TOPIC_SUBSCRIPTIONS]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                chat_id = int(item["chat_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            keyword = " ".join(str(item.get("keyword", "")).split())[:80]
+            if keyword:
+                result.append({"chat_id": chat_id, "keyword": keyword, "last_sent": str(item.get("last_sent", ""))})
+        return result
+
+    def _retention_overrides(self) -> dict[int, int]:
+        try:
+            raw = json.loads(self.archive.get_state(RETENTION_OVERRIDES_STATE) or "{}")
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        values: dict[int, int] = {}
+        for key, value in raw.items():
+            try:
+                chat_id, days = int(key), int(value)
+            except (TypeError, ValueError):
+                continue
+            if MIN_GROUP_RETENTION_DAYS <= days <= MAX_GROUP_RETENTION_DAYS:
+                values[chat_id] = days
+        return values
+
+    def _llm_metrics_text(self) -> str:
+        metrics = getattr(self.llm, "metrics", {})
+        requests = int(metrics.get("requests", 0))
+        failures = int(metrics.get("failures", 0))
+        latency = float(metrics.get("latency_ms", 0.0))
+        avg = latency / requests if requests else 0.0
+        return f"{requests} 次，失败 {failures} 次，平均 {avg:.0f}ms"
+
+    def _save_topic_subscriptions(self, values: Sequence[dict[str, Any]]) -> None:
+        self.archive.set_state(TOPIC_SUBSCRIPTIONS_STATE, json.dumps(list(values)[:MAX_TOPIC_SUBSCRIPTIONS], ensure_ascii=False))
+
+    def _topics_picker(self) -> tuple[str, list[list[Any]]]:
+        subscriptions = self._topic_subscriptions()
+        lines = ["话题订阅", "命中关键词后由 AI 判断是否为新进展，并私聊提醒。"]
+        buttons: list[list[Any]] = [[Button.inline("添加订阅", data=b"tp:0")]]
+        for index, item in enumerate(subscriptions):
+            source = self.available_sources.get(int(item["chat_id"]))
+            name = source.name if source else str(item["chat_id"])
+            lines.append(f"- {name}：{item['keyword']}")
+            buttons.append([Button.inline("移除：" + _short_name(f"{name} {item['keyword']}", 28), data=f"td:{index}".encode())])
+        if len(subscriptions) >= MAX_TOPIC_SUBSCRIPTIONS:
+            lines.append(f"已达到 {MAX_TOPIC_SUBSCRIPTIONS} 个订阅上限。")
+        return "\n".join(lines), buttons
+
+    def _topic_target_picker(self, page: int) -> tuple[str, list[list[Any]]]:
+        groups = sorted(self.available_sources.values(), key=lambda source: source.name.casefold())
+        pages = max(1, (len(groups) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        current = groups[page * GROUPS_PAGE_SIZE : (page + 1) * GROUPS_PAGE_SIZE]
+        buttons = [[Button.inline(_short_name(source.name, 34), data=f"ti:{page}:{source.chat_id}".encode())] for source in current]
+        navigation: list[Any] = []
+        if page > 0:
+            navigation.append(Button.inline("上一页", data=f"tp:{page - 1}".encode()))
+        if page + 1 < pages:
+            navigation.append(Button.inline("下一页", data=f"tp:{page + 1}".encode()))
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([Button.inline("返回订阅", data=b"tp:back")])
+        return f"选择要订阅的群组（第 {page + 1}/{pages} 页）：", buttons
+
     def _checkin_picker(self) -> tuple[str, list[list[Any]]]:
         configs = self._checkin_configs()
         if not configs:
@@ -596,6 +714,7 @@ class TelegramInsightService:
                 lines.append(
                     f"- {self._checkin_label(chat_id)}：{state}，"
                     f"{config.hour:02d}:{config.minute:02d}+随机偏移，上次 {last}"
+                    + (f"，连续失败 {config.failure_streak} 天" if config.failure_streak else "")
                 )
             text = "\n".join(lines)
         buttons: list[list[Any]] = [
@@ -890,6 +1009,44 @@ class TelegramInsightService:
                 await event.answer()
                 await event.edit("请发送逗号分隔的关键词，例如：紧急,故障,截止,涨价")
                 return
+            if action == "tp" and len(parts) == 2:
+                if parts[1] == "back":
+                    text, buttons = self._topics_picker()
+                    await event.edit(text, buttons=buttons)
+                    return
+                if len(self._topic_subscriptions()) >= MAX_TOPIC_SUBSCRIPTIONS:
+                    await event.answer("已达到订阅上限。", alert=True)
+                    return
+                text, buttons = self._topic_target_picker(int(parts[1]))
+                await event.answer()
+                await event.edit(text, buttons=buttons)
+                return
+            if action == "ti" and len(parts) == 3:
+                chat_id = int(parts[2])
+                if chat_id not in self.available_sources:
+                    raise ValueError("unknown topic target")
+                self._pending_topic_users[event.sender_id] = chat_id
+                await event.answer()
+                await event.edit("请发送要关注的关键词，例如：固件发布、漏洞、价格变化")
+                return
+            if action == "td" and len(parts) == 2:
+                index = int(parts[1])
+                subscriptions = self._topic_subscriptions()
+                if not 0 <= index < len(subscriptions):
+                    raise ValueError("unknown topic subscription")
+                subscriptions.pop(index)
+                self._save_topic_subscriptions(subscriptions)
+                await event.answer("订阅已移除。")
+                text, buttons = self._topics_picker()
+                await event.edit(text, buttons=buttons)
+                return
+            if action == "af" and len(parts) == 3:
+                feedback, encoded = parts[1], parts[2]
+                chat_id, topic = _decode_alert_feedback(encoded)
+                self._save_alert_feedback(chat_id, topic, feedback)
+                await event.answer("反馈已保存。")
+                await event.edit("已记录你的反馈，后续会减少相同主题的重复提醒。")
+                return
             if action in {"ks", "ki", "k7", "kx"} and len(parts) == 2:
                 chat_id = int(parts[1])
                 source = self.available_sources.get(chat_id)
@@ -1150,6 +1307,34 @@ class TelegramInsightService:
             self._pending_alert_keywords_users.discard(event.sender_id)
             await event.reply("重大事件提醒关键词已保存。")
             return
+        if event.sender_id in self._pending_retention_users:
+            raw_chat, raw_days = (item.strip() for item in event.raw_text.split(",", 1))
+            try:
+                chat_id, days = int(raw_chat), int(raw_days)
+            except ValueError:
+                chat_id = days = 0
+            if chat_id in self.available_sources and MIN_GROUP_RETENTION_DAYS <= days <= MAX_GROUP_RETENTION_DAYS:
+                overrides = self._retention_overrides()
+                overrides[chat_id] = days
+                self.archive.set_state(RETENTION_OVERRIDES_STATE, json.dumps({str(k): v for k, v in overrides.items()}))
+                await event.reply(f"已设置该群保留 {days} 天。")
+                self._pending_retention_users.discard(event.sender_id)
+                return
+            await event.reply("格式无效，请发送：群组 ID,天数（1-3650）。")
+            return
+        chat_id = self._pending_topic_users.get(event.sender_id)
+        if chat_id is not None:
+            keyword = " ".join(event.raw_text.split())[:80]
+            if not keyword:
+                await event.reply("关键词不能为空。")
+                return
+            subscriptions = self._topic_subscriptions()
+            subscriptions = [item for item in subscriptions if not (item["chat_id"] == chat_id and item["keyword"].casefold() == keyword.casefold())]
+            subscriptions.append({"chat_id": chat_id, "keyword": keyword, "last_sent": ""})
+            self._save_topic_subscriptions(subscriptions)
+            self._pending_topic_users.pop(event.sender_id, None)
+            await event.reply("话题订阅已保存。发送 /topics 可管理。")
+            return
         chat_id = self._pending_checkin_topic_users.get(event.sender_id)
         if chat_id is not None:
             raw_topic = event.raw_text.strip()
@@ -1248,7 +1433,7 @@ class TelegramInsightService:
                         messages.append(item)
                     if len(messages) >= self.settings.query_max_sources:
                         break
-            answer = await self.llm.answer(question, messages)
+            answer = await self.llm.answer(question, _redact_messages(messages))
             await progress.delete()
             await _send_long(event, render_answer(answer))
         except Exception:
@@ -1323,6 +1508,48 @@ class TelegramInsightService:
         enabled = bool(raw.get("enabled", True))
         keywords = _parse_alert_keywords(raw.get("keywords", ALERT_KEYWORDS_DEFAULT))
         return enabled, keywords or _parse_alert_keywords(ALERT_KEYWORDS_DEFAULT)
+
+    def _alert_topic_ignored(self, chat_id: int, topic: str) -> bool:
+        try:
+            raw = json.loads(self.archive.get_state(ALERT_IGNORED_TOPICS_STATE) or "{}")
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        topics = raw.get(str(chat_id), [])
+        if not isinstance(topics, list):
+            return False
+        fingerprint = _alert_topic_fingerprint(topic)
+        return fingerprint in {str(item)[:100] for item in topics}
+
+    def _save_alert_feedback(self, chat_id: int, topic: str, feedback: str) -> None:
+        fingerprint = _alert_topic_fingerprint(topic)
+        if not fingerprint or feedback not in {"important", "ignore"}:
+            raise ValueError("invalid alert feedback")
+        try:
+            feedbacks = json.loads(self.archive.get_state(ALERT_FEEDBACK_STATE) or "{}")
+        except json.JSONDecodeError:
+            feedbacks = {}
+        if not isinstance(feedbacks, dict):
+            feedbacks = {}
+        feedbacks.setdefault(str(chat_id), {})[fingerprint] = feedback
+        self.archive.set_state(ALERT_FEEDBACK_STATE, json.dumps(feedbacks, ensure_ascii=False))
+        if feedback != "ignore":
+            return
+        try:
+            ignored = json.loads(self.archive.get_state(ALERT_IGNORED_TOPICS_STATE) or "{}")
+        except json.JSONDecodeError:
+            ignored = {}
+        if not isinstance(ignored, dict):
+            ignored = {}
+        topics = ignored.setdefault(str(chat_id), [])
+        if not isinstance(topics, list):
+            topics = []
+            ignored[str(chat_id)] = topics
+        if fingerprint not in topics:
+            topics.append(fingerprint)
+        ignored[str(chat_id)] = topics[-50:]
+        self.archive.set_state(ALERT_IGNORED_TOPICS_STATE, json.dumps(ignored, ensure_ascii=False))
 
     async def _refresh_dialogs(self) -> int:
         async with self._refresh_lock:
@@ -1532,8 +1759,8 @@ class TelegramInsightService:
                         candidate.source_name,
                         candidate.source_sender,
                         candidate.source_time,
-                        candidate.source_text,
-                        candidate.bot_reply,
+                        _redact_for_llm(candidate.source_text),
+                        _redact_for_llm(candidate.bot_reply),
                     )
                 except Exception as exc:
                     if not _is_retryable_checkin_ai_error(exc):
@@ -1668,15 +1895,25 @@ class TelegramInsightService:
         )
 
     async def _notify_checkin_failure(self, chat_id: int, detail: str) -> None:
+        config = self._checkin_configs().get(chat_id)
+        escalation = ""
+        if config is not None and config.failure_streak >= CHECKIN_FAILURE_ESCALATION_DAYS:
+            escalation = (
+                f"\n升级提醒：该目标已连续失败 {config.failure_streak} 天，"
+                "请检查目标是否改名、命令是否失效或 Bot 是否异常。"
+            )
         await self.bot.send_message(
             self.settings.summary_target,
-            f"自动签到失败：{self._checkin_label(chat_id)}\n{detail[:500]}",
+            f"自动签到失败：{self._checkin_label(chat_id)}\n{detail[:500]}{escalation}",
             link_preview=False,
         )
 
     async def _schedule_alert_analysis(self, event: Any) -> None:
         enabled, keywords = self._alert_config()
-        if not enabled or not getattr(event, "is_group", False):
+        subscriptions = self._topic_subscriptions()
+        if not enabled and not subscriptions:
+            return
+        if not getattr(event, "is_group", False):
             return
         source = self.sources.get(getattr(event, "chat_id", None))
         text = (getattr(event, "raw_text", "") or "").strip()
@@ -1687,12 +1924,21 @@ class TelegramInsightService:
         if now - message_time > ALERT_MAX_MESSAGE_AGE:
             return
         lowered = text.casefold()
-        signals = tuple(
-            signal
-            for signal in (*keywords, *ALERT_EVENT_HINTS)
-            if signal.casefold() in lowered
+        signals = (
+            tuple(
+                signal
+                for signal in (*keywords, *ALERT_EVENT_HINTS)
+                if signal.casefold() in lowered
+            )
+            if enabled
+            else ()
         )
-        if not signals:
+        topic_match = any(
+            int(item["chat_id"]) == source.chat_id
+            and str(item["keyword"]).casefold() in lowered
+            for item in subscriptions
+        )
+        if not signals and not topic_match:
             return
         task = asyncio.create_task(
             self._analyze_alert(source, text, event, signals), name="ai-event-alert"
@@ -1708,20 +1954,20 @@ class TelegramInsightService:
             message_time = _event_message_time(event)
             context = self.archive.recent((source.chat_id,), ALERT_CONTEXT_MESSAGES)
             decision = await self.llm.detect_event(
-                source.name, text, context, message_time, now
+                source.name, _redact_for_llm(text), _redact_messages(context), message_time, now
             )
-            if not decision.alert:
-                return
-            async with self._alert_lock:
-                if self._is_duplicate_alert(source.chat_id, decision, now):
-                    log.info(
-                        "Suppressed repeated event alert for chat id=%s topic=%s signals=%s",
-                        source.chat_id,
-                        decision.topic,
-                        ",".join(signals),
-                    )
-                    return
-                await self._send_alert(source, text, decision, event)
+            if decision.alert:
+                async with self._alert_lock:
+                    if self._is_duplicate_alert(source.chat_id, decision, now):
+                        log.info(
+                            "Suppressed repeated event alert for chat id=%s topic=%s signals=%s",
+                            source.chat_id,
+                            decision.topic,
+                            ",".join(signals),
+                        )
+                    elif not self._alert_topic_ignored(source.chat_id, decision.topic):
+                        await self._send_alert(source, text, decision, event)
+            await self._notify_topic_subscriptions(source, text, event, message_time, now)
         except Exception:
             log.exception("Event alert analysis failed for chat id=%s", source.chat_id)
 
@@ -1750,6 +1996,7 @@ class TelegramInsightService:
             link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}"
         else:
             link_text = ""
+        encoded = _encode_alert_feedback(source.chat_id, decision.topic)
         await self.bot.send_message(
             self.settings.summary_target,
             (
@@ -1759,12 +2006,46 @@ class TelegramInsightService:
                 f"新增信息：{decision.new_information}\n"
                 f"原消息：{text[:1200]}{link_text}"
             ),
+            buttons=[
+                [
+                    Button.inline("重要", data=f"af:important:{encoded}".encode()),
+                    Button.inline("忽略此主题", data=f"af:ignore:{encoded}".encode()),
+                ]
+            ],
             link_preview=False,
         )
         topic = _alert_topic_fingerprint(decision.topic)
         self._alert_last_sent[(source.chat_id, topic)] = AlertRecord(
             dt.datetime.now(dt.timezone.utc), decision.new_information
         )
+
+    async def _notify_topic_subscriptions(
+        self, source: SourceChat, text: str, event: Any, message_time: dt.datetime, now: dt.datetime
+    ) -> None:
+        subscriptions = self._topic_subscriptions()
+        matched = [item for item in subscriptions if int(item["chat_id"]) == source.chat_id and str(item["keyword"]).casefold() in text.casefold()]
+        if not matched:
+            return
+        changed = False
+        for item in matched:
+            last = _state_datetime(item.get("last_sent"), dt.timezone.utc)
+            if last is not None and now - last < TOPIC_SUBSCRIPTION_COOLDOWN:
+                continue
+            context = _redact_messages(self.archive.recent((source.chat_id,), ALERT_CONTEXT_MESSAGES))
+            decision = await self.llm.detect_event(source.name, _redact_for_llm(text), context, message_time, now)
+            if not decision.alert or self._alert_topic_ignored(source.chat_id, decision.topic):
+                continue
+            item["last_sent"] = now.isoformat()
+            changed = True
+            link = getattr(getattr(event, "message", None), "id", None)
+            link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}" if link and source.username else ""
+            await self.bot.send_message(
+                self.settings.summary_target,
+                f"话题订阅提醒：{source.name}\n关键词：{item['keyword']}\n{decision.new_information}\n原消息：{text[:1000]}{link_text}",
+                link_preview=False,
+            )
+        if changed:
+            self._save_topic_subscriptions(subscriptions)
 
     async def _run_due_checkins(self, now: dt.datetime) -> None:
         today = now.date().isoformat()
@@ -1884,7 +2165,7 @@ class TelegramInsightService:
             )
             if not messages:
                 return source.chat_id, "uncertain"
-            return source.chat_id, await self.llm.classify_content(messages)
+            return source.chat_id, await self.llm.classify_content(_redact_messages(messages))
 
         results = await asyncio.gather(
             *(classify(source) for source in candidates), return_exceptions=True
@@ -1948,10 +2229,12 @@ class TelegramInsightService:
                 attempt = attempts + 1
                 self.archive.set_state("digest_attempt_count", str(attempt))
                 try:
-                    await self._send_digest(self.settings.summary_target)
+                    await self._send_digest_with_mode(self.settings.summary_target, advance_cursors=True)
                     self.archive.set_state("last_digest_day", day_key)
                     self.archive.set_state("digest_retry_at", "")
                     self.archive.prune(self.settings.retention_days)
+                    for chat_id, days in self._retention_overrides().items():
+                        self.archive.prune_chat(chat_id, days)
                 except Exception:
                     log.exception("Scheduled digest failed")
                     self.archive.set_state(
@@ -1991,24 +2274,54 @@ class TelegramInsightService:
         self.archive.set_state(CHECKIN_REPORT_STATE, day)
 
     async def _send_digest(self, target: int | str) -> None:
+        await self._send_digest_with_mode(target, advance_cursors=False)
+
+    async def _send_digest_with_mode(self, target: int | str, *, advance_cursors: bool) -> None:
         async with self._digest_lock:
             now = dt.datetime.now(dt.timezone.utc)
             source_ids = await self._summary_source_ids()
-            messages = self.archive.range(
-                source_ids,
-                now - dt.timedelta(hours=24),
-                now,
-                self.settings.summary_max_messages,
-            )
+            cursors = self._digest_cursors()
+            records: dict[tuple[int, int], StoredMessage] = {}
+            for chat_id in source_ids:
+                cursor = cursors.get(str(chat_id))
+                start = _state_datetime(cursor, dt.timezone.utc) if cursor else None
+                if start is None:
+                    start = now - dt.timedelta(hours=24)
+                else:
+                    # Small overlap preserves context for an ongoing topic without
+                    # turning the digest back into a full-history report.
+                    start -= dt.timedelta(hours=2)
+                for item in self.archive.range((chat_id,), start, now, self.settings.summary_max_messages):
+                    records[(item.chat_id, item.message_id)] = item
+            messages = sorted(records.values(), key=lambda item: item.sent_at)
+            messages = messages[-self.settings.summary_max_messages :]
             messages = limit_summary_messages(
-                messages, self.settings.summary_max_chars
+                _redact_messages(messages), self.settings.summary_max_chars
             )
             if not messages:
                 await self.bot.send_message(target, "过去 24 小时没有可参与摘要的归档消息。")
+                if advance_cursors:
+                    self._set_digest_cursors(source_ids, now)
                 return
             now = dt.datetime.now(ZoneInfo(self.settings.timezone))
             digest = await self.llm.daily_digest(messages, now.date(), as_of=now)
             await _send_long(self.bot, digest, target=target)
+            if advance_cursors:
+                self._set_digest_cursors(source_ids, dt.datetime.now(dt.timezone.utc))
+
+    def _digest_cursors(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self.archive.get_state(DIGEST_CURSORS_STATE) or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _set_digest_cursors(self, chat_ids: Sequence[int], value: dt.datetime) -> None:
+        cursors = self._digest_cursors()
+        stamp = value.astimezone(dt.timezone.utc).isoformat()
+        for chat_id in chat_ids:
+            cursors[str(chat_id)] = stamp
+        self.archive.set_state(DIGEST_CURSORS_STATE, json.dumps(cursors, ensure_ascii=False))
 
     async def _set_bot_commands(self) -> None:
         await self.bot(
@@ -2023,6 +2336,8 @@ class TelegramInsightService:
                     types.BotCommand(command="content", description="管理成人内容摘要排除"),
                     types.BotCommand(command="checkin", description="管理自动签到"),
                     types.BotCommand(command="alerts", description="配置重大事件提醒"),
+                    types.BotCommand(command="topics", description="管理关键词话题订阅"),
+                    types.BotCommand(command="retention", description="设置单群消息保留天数"),
                     types.BotCommand(command="refresh", description="刷新群组和机器人列表"),
                     types.BotCommand(command="backup", description="导出消息数据库备份"),
                     types.BotCommand(command="settings", description="设置每日推送"),
@@ -2128,6 +2443,12 @@ def _checkin_configs_from_state(value: str | None) -> dict[int, CheckinConfig]:
             topic_id=topic_id,
             last_status=str(raw_config.get("last_status", ""))[:40],
             last_detail=str(raw_config.get("last_detail", ""))[:300],
+            failure_streak=(
+                int(raw_config.get("failure_streak", 0))
+                if isinstance(raw_config.get("failure_streak", 0), int)
+                and 0 <= int(raw_config.get("failure_streak", 0)) <= 365
+                else 0
+            ),
             history=history,
         )
         if len(configs) >= MAX_CHECKIN_TARGETS:
@@ -2149,6 +2470,7 @@ def _checkin_config_to_json(config: CheckinConfig) -> dict[str, str | int | bool
         "topic_id": config.topic_id,
         "last_status": config.last_status,
         "last_detail": config.last_detail,
+        "failure_streak": config.failure_streak,
         "history": [
             {"day": record.day, "at": record.at, "status": record.status, "detail": record.detail}
             for record in config.history[-CHECKIN_HISTORY_LIMIT:]
@@ -2193,7 +2515,14 @@ def _append_checkin_record(config: CheckinConfig, status: str, detail: str, now:
         detail=detail[:300],
     )
     history = tuple((*config.history, record)[-CHECKIN_HISTORY_LIMIT:])
-    return _replace_checkin(config, last_status=status, last_detail=detail[:300], history=history)
+    failure_streak = config.failure_streak + 1 if status in {"failed", "send_failed"} else 0
+    return _replace_checkin(
+        config,
+        last_status=status,
+        last_detail=detail[:300],
+        failure_streak=min(failure_streak, 365),
+        history=history,
+    )
 
 
 def _checkin_verification_status(
@@ -2389,6 +2718,52 @@ def _safe_datetime(value: Any) -> str:
 def _safe_error(exc: Exception) -> str:
     text = " ".join(str(exc).split())
     return text[:300] or type(exc).__name__
+
+
+_SENSITIVE_PATTERNS = (
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"), "[REDACTED_BOT_TOKEN]"),
+    (re.compile(r"\b[A-Fa-f0-9]{32}\b"), "[REDACTED_HASH]"),
+    (re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
+    (re.compile(r"(?<!\d)(?:\+?\d[\d -]{7,}\d)(?!\d)"), "[REDACTED_PHONE]"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
+)
+
+
+def _redact_for_llm(value: str) -> str:
+    redacted = value
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_messages(messages: Sequence[StoredMessage]) -> list[StoredMessage]:
+    return [
+        StoredMessage(
+            chat_id=item.chat_id,
+            message_id=item.message_id,
+            chat_name=_redact_for_llm(item.chat_name),
+            chat_username=item.chat_username,
+            sender_id=item.sender_id,
+            sender_name=_redact_for_llm(item.sender_name),
+            sent_at=item.sent_at,
+            text=_redact_for_llm(item.text),
+            reply_to_id=item.reply_to_id,
+        )
+        for item in messages
+    ]
+
+
+def _encode_alert_feedback(chat_id: int, topic: str) -> str:
+    value = f"{chat_id}|{_alert_topic_fingerprint(topic)}".encode()
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def _decode_alert_feedback(value: str) -> tuple[int, str]:
+    padded = value + "=" * (-len(value) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode()).decode()
+    chat_id, topic = raw.split("|", 1)
+    return int(chat_id), topic[:100]
 
 
 CONTENT_STATUS_LABELS = {

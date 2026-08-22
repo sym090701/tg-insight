@@ -41,6 +41,11 @@ from tg_insight.service import (
     _checkin_suggestion_retry_delay,
     _checkin_suggestion_expired,
     _checkin_status_available,
+    _redact_for_llm,
+    _redact_messages,
+    _encode_alert_feedback,
+    _decode_alert_feedback,
+    _append_checkin_record,
     split_message,
 )
 
@@ -516,6 +521,30 @@ def test_checkin_status_uses_configured_primary_or_fallback_model() -> None:
         },
         ("gpt-5.6-luna",),
     ) is None
+
+
+def test_llm_redaction_removes_common_credentials_and_preserves_shape() -> None:
+    secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+    text = f"token {secret} bot 123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijk"
+    assert secret not in _redact_for_llm(text)
+    assert "[REDACTED_API_KEY]" in _redact_for_llm(text)
+    assert "[REDACTED_BOT_TOKEN]" in _redact_for_llm(text)
+
+
+def test_alert_feedback_encoding_is_safe_and_round_trips() -> None:
+    encoded = _encode_alert_feedback(-1001, "支付服务中断")
+    assert "+" not in encoded and "/" not in encoded and "=" not in encoded
+    assert _decode_alert_feedback(encoded) == (-1001, "支付服务中断")
+
+
+def test_checkin_failure_streak_increments_and_resets() -> None:
+    config = CheckinConfig()
+    now = dt.datetime.now(dt.timezone.utc)
+    failed = _append_checkin_record(config, "failed", "503", now)
+    failed = _append_checkin_record(failed, "send_failed", "timeout", now)
+    assert failed.failure_streak == 2
+    recovered = _append_checkin_record(failed, "verified", "签到成功", now)
+    assert recovered.failure_streak == 0
 
 
 @pytest.mark.asyncio
