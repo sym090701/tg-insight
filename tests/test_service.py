@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from zoneinfo import ZoneInfo
 
+from tg_insight.database import DeferredCheckinSuggestion
 from tg_insight.service import (
     ALERT_TOPIC_COOLDOWN,
     AlertRecord,
@@ -40,6 +41,7 @@ from tg_insight.service import (
     _is_checkin_suggestion_candidate,
     _checkin_suggestion_retry_delay,
     _checkin_suggestion_expired,
+    _next_checkin_suggestion_midnight,
     _checkin_status_available,
     _redact_for_llm,
     _redact_messages,
@@ -496,6 +498,13 @@ def test_checkin_suggestion_expiration_uses_utc() -> None:
     assert _checkin_suggestion_expired(now - dt.timedelta(hours=25))
 
 
+def test_deferred_checkin_suggestion_retry_is_next_local_midnight() -> None:
+    now = dt.datetime(2026, 8, 20, 23, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert _next_checkin_suggestion_midnight(now) == dt.datetime(
+        2026, 8, 21, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")
+    )
+
+
 def test_checkin_status_uses_configured_primary_or_fallback_model() -> None:
     generated_at = dt.datetime.now(dt.timezone.utc).timestamp()
     payload = {
@@ -684,6 +693,96 @@ async def test_checkin_suggestion_keeps_candidate_after_temporary_ai_failure(mon
     assert calls == 2
     assert len(sent) == 1
     assert (-1001, 7) not in service._checkin_suggestion_candidates
+
+
+@pytest.mark.asyncio
+async def test_checkin_suggestion_defers_404_until_midnight(monkeypatch) -> None:
+    saved: list[DeferredCheckinSuggestion] = []
+
+    class Archive:
+        def get_state(self, _key):
+            return None
+
+        def defer_checkin_suggestion(self, suggestion):
+            saved.append(suggestion)
+
+    class NotFoundError(Exception):
+        status_code = 404
+
+    class LLM:
+        async def assess_checkin_suggestion(self, *_args):
+            raise NotFoundError("model unavailable")
+
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(timezone="Asia/Shanghai")
+    service.archive = Archive()
+    service.llm = LLM()
+    service._checkin_suggestion_days = set()
+    service._checkin_suggestion_candidates = {
+        (-1001, 7): CheckinSuggestionCandidate(
+            -1001, 7, "签到群", None, "Alice", dt.datetime.now(dt.timezone.utc), "/qd", "签到成功"
+        )
+    }
+    service._checkin_configs = lambda: {}
+    service._checkin_suggestion_ignored = lambda *_args: False
+    service._checkin_ai_unavailable = lambda: asyncio.sleep(0, result=False)
+    monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
+
+    await service._analyze_checkin_suggestion((-1001, 7))
+
+    assert (-1001, 7) not in service._checkin_suggestion_candidates
+    assert len(saved) == 1
+    assert saved[0].last_error == "model unavailable"
+    assert saved[0].retry_after.hour == 0
+    assert saved[0].retry_after.minute == 0
+    assert saved[0].retry_after.date() > dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+
+@pytest.mark.asyncio
+async def test_deferred_checkin_suggestion_replays_when_due() -> None:
+    now = dt.datetime(2026, 8, 21, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    saved = DeferredCheckinSuggestion(
+        chat_id=-1001,
+        message_id=7,
+        source_name="签到群",
+        source_username=None,
+        source_sender="Alice",
+        source_time=now - dt.timedelta(hours=1),
+        source_text="/qd",
+        bot_reply="签到成功",
+        retry_after=now,
+        retry_count=0,
+        last_error="HTTP 404",
+    )
+    rescheduled: list[tuple[int, int, dt.datetime]] = []
+    calls: list[tuple[tuple[int, int], bool, bool]] = []
+
+    class Archive:
+        def due_deferred_checkin_suggestions(self, _now):
+            return [saved]
+
+        def reschedule_deferred_checkin_suggestion(self, chat_id, message_id, retry_after):
+            rescheduled.append((chat_id, message_id, retry_after))
+
+        def delete_deferred_checkin_suggestion(self, *_args):
+            raise AssertionError("candidate should be replayed")
+
+    async def analyze(candidate_key, *, wait_for_bot_reply, deferred):
+        calls.append((candidate_key, wait_for_bot_reply, deferred))
+
+    service = object.__new__(TelegramInsightService)
+    service.archive = Archive()
+    service._checkin_suggestion_candidates = {}
+    service._checkin_suggestion_tasks = set()
+    service._checkin_configs = lambda: {}
+    service._checkin_suggestion_ignored = lambda *_args: False
+    service._analyze_checkin_suggestion = analyze
+
+    service._retry_deferred_checkin_suggestions(now)
+    await asyncio.sleep(0)
+
+    assert rescheduled == [(-1001, 7, dt.datetime(2026, 8, 22, 0, 0, tzinfo=now.tzinfo))]
+    assert calls == [((-1001, 7), False, True)]
 
 
 @pytest.mark.asyncio

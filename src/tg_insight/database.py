@@ -36,6 +36,21 @@ class StoredMessage:
         return None
 
 
+@dataclass(frozen=True)
+class DeferredCheckinSuggestion:
+    chat_id: int
+    message_id: int
+    source_name: str
+    source_username: str | None
+    source_sender: str
+    source_time: dt.datetime
+    source_text: str
+    bot_reply: str
+    retry_after: dt.datetime
+    retry_count: int
+    last_error: str
+
+
 class Archive:
     def __init__(
         self, path: Path, max_messages: int, min_free_mb: int, max_bytes: int | None = None
@@ -102,6 +117,23 @@ class Archive:
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS deferred_checkin_suggestions (
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    source_name TEXT NOT NULL,
+                    source_username TEXT,
+                    source_sender TEXT NOT NULL,
+                    source_time TEXT NOT NULL,
+                    source_text TEXT NOT NULL,
+                    bot_reply TEXT NOT NULL,
+                    retry_after TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL,
+                    PRIMARY KEY (chat_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_deferred_checkin_retry_after
+                    ON deferred_checkin_suggestions(retry_after);
                 """
             )
             self._message_count = int(
@@ -334,6 +366,73 @@ class Archive:
                 (key, value),
             )
 
+    def defer_checkin_suggestion(self, suggestion: DeferredCheckinSuggestion) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO deferred_checkin_suggestions (
+                    chat_id, message_id, source_name, source_username, source_sender,
+                    source_time, source_text, bot_reply, retry_after, retry_count, last_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(chat_id, message_id) DO UPDATE SET
+                    source_name=excluded.source_name,
+                    source_username=excluded.source_username,
+                    source_sender=excluded.source_sender,
+                    source_time=excluded.source_time,
+                    source_text=excluded.source_text,
+                    bot_reply=excluded.bot_reply,
+                    retry_after=excluded.retry_after,
+                    last_error=excluded.last_error
+                """,
+                (
+                    suggestion.chat_id,
+                    suggestion.message_id,
+                    suggestion.source_name,
+                    suggestion.source_username,
+                    suggestion.source_sender,
+                    _utc_iso(suggestion.source_time),
+                    suggestion.source_text,
+                    suggestion.bot_reply,
+                    _utc_iso(suggestion.retry_after),
+                    suggestion.retry_count,
+                    suggestion.last_error[:500],
+                ),
+            )
+
+    def due_deferred_checkin_suggestions(
+        self, now: dt.datetime
+    ) -> list[DeferredCheckinSuggestion]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM deferred_checkin_suggestions
+                WHERE retry_after <= ?
+                ORDER BY retry_after ASC, source_time ASC
+                """,
+                (_utc_iso(now),),
+            ).fetchall()
+        return [_row_to_deferred_checkin_suggestion(row) for row in rows]
+
+    def reschedule_deferred_checkin_suggestion(
+        self, chat_id: int, message_id: int, retry_after: dt.datetime
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE deferred_checkin_suggestions
+                SET retry_after=?, retry_count=retry_count + 1
+                WHERE chat_id=? AND message_id=?
+                """,
+                (_utc_iso(retry_after), chat_id, message_id),
+            )
+
+    def delete_deferred_checkin_suggestion(self, chat_id: int, message_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "DELETE FROM deferred_checkin_suggestions WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id),
+            )
+
     def backup_to(self, destination: Path) -> None:
         """Create a consistent SQLite backup without copying a live WAL file."""
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -382,4 +481,20 @@ def _row_to_message(row: sqlite3.Row) -> StoredMessage:
         sent_at=dt.datetime.fromisoformat(str(row["sent_at"])),
         text=str(row["text"]),
         reply_to_id=row["reply_to_id"],
+    )
+
+
+def _row_to_deferred_checkin_suggestion(row: sqlite3.Row) -> DeferredCheckinSuggestion:
+    return DeferredCheckinSuggestion(
+        chat_id=int(row["chat_id"]),
+        message_id=int(row["message_id"]),
+        source_name=str(row["source_name"]),
+        source_username=row["source_username"],
+        source_sender=str(row["source_sender"]),
+        source_time=dt.datetime.fromisoformat(str(row["source_time"])),
+        source_text=str(row["source_text"]),
+        bot_reply=str(row["bot_reply"]),
+        retry_after=dt.datetime.fromisoformat(str(row["retry_after"])),
+        retry_count=int(row["retry_count"]),
+        last_error=str(row["last_error"]),
     )

@@ -16,7 +16,7 @@ import aiohttp
 from telethon import Button, TelegramClient, events, functions, types
 
 from .config import Settings
-from .database import Archive, StoredMessage
+from .database import Archive, DeferredCheckinSuggestion, StoredMessage
 from .llm import (
     CONTENT_CATEGORIES,
     CheckinSuggestionDecision,
@@ -65,6 +65,7 @@ CHECKIN_SUGGESTION_STATUS_MAX_AGE_SECONDS = 15 * 60
 CHECKIN_SUGGESTION_RETRY_INITIAL_SECONDS = 30
 CHECKIN_SUGGESTION_RETRY_MAX_SECONDS = 15 * 60
 CHECKIN_SUGGESTION_MAX_AGE = dt.timedelta(hours=24)
+CHECKIN_SUGGESTION_DEFERRED_MAX_AGE = dt.timedelta(days=7)
 CHECKIN_SUCCESS_KEYWORDS = (
     "签到成功",
     "已签到",
@@ -1659,17 +1660,25 @@ class TelegramInsightService:
         if candidate is not None and not candidate.bot_reply:
             candidate.bot_reply = text[:MAX_CHECKIN_TEXT_LENGTH]
 
-    async def _analyze_checkin_suggestion(self, candidate_key: tuple[int, int]) -> None:
+    async def _analyze_checkin_suggestion(
+        self, candidate_key: tuple[int, int], *, wait_for_bot_reply: bool = True, deferred: bool = False
+    ) -> None:
         try:
-            await asyncio.sleep(CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS)
+            if wait_for_bot_reply:
+                await asyncio.sleep(CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS)
             attempt = 0
             while True:
                 candidate = self._checkin_suggestion_candidates.get(candidate_key)
                 if candidate is None or not candidate.bot_reply:
                     self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    if deferred:
+                        self.archive.delete_deferred_checkin_suggestion(*candidate_key)
                     return
-                if _checkin_suggestion_expired(candidate.source_time):
+                max_age = CHECKIN_SUGGESTION_DEFERRED_MAX_AGE if deferred else CHECKIN_SUGGESTION_MAX_AGE
+                if _checkin_suggestion_expired(candidate.source_time, max_age=max_age):
                     self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    if deferred:
+                        self.archive.delete_deferred_checkin_suggestion(*candidate_key)
                     log.info("Dropping expired check-in suggestion candidate=%s", candidate_key)
                     return
                 day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
@@ -1680,6 +1689,8 @@ class TelegramInsightService:
                     or self._checkin_suggestion_ignored(candidate.chat_id, dt.date.fromisoformat(day))
                 ):
                     self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    if deferred:
+                        self.archive.delete_deferred_checkin_suggestion(*candidate_key)
                     return
 
                 # The public status probe is only a back-pressure signal. An unknown or
@@ -1705,8 +1716,19 @@ class TelegramInsightService:
                         _redact_for_llm(candidate.bot_reply),
                     )
                 except Exception as exc:
+                    if _is_deferred_checkin_ai_error(exc):
+                        self._checkin_suggestion_candidates.pop(candidate_key, None)
+                        self._defer_checkin_suggestion(candidate, exc)
+                        log.warning(
+                            "Deferring check-in suggestion candidate=%s until the next midnight retry: %s",
+                            candidate_key,
+                            _safe_error(exc),
+                        )
+                        return
                     if not _is_retryable_checkin_ai_error(exc):
                         self._checkin_suggestion_candidates.pop(candidate_key, None)
+                        if deferred:
+                            self.archive.delete_deferred_checkin_suggestion(*candidate_key)
                         log.exception("Check-in suggestion analysis failed permanently for candidate=%s", candidate_key)
                         return
                     delay = _checkin_suggestion_retry_delay(attempt)
@@ -1721,6 +1743,8 @@ class TelegramInsightService:
                     continue
 
                 self._checkin_suggestion_candidates.pop(candidate_key, None)
+                if deferred:
+                    self.archive.delete_deferred_checkin_suggestion(*candidate_key)
                 if not decision.should_suggest or not _is_literal_checkin_proposal(
                     decision.proposed_text, candidate.source_text
                 ):
@@ -1759,6 +1783,62 @@ class TelegramInsightService:
                 return
         except Exception:
             log.exception("Check-in suggestion analysis failed for candidate=%s", candidate_key)
+
+    def _defer_checkin_suggestion(self, candidate: CheckinSuggestionCandidate, exc: Exception) -> None:
+        now = dt.datetime.now(ZoneInfo(self.settings.timezone))
+        self.archive.defer_checkin_suggestion(
+            DeferredCheckinSuggestion(
+                chat_id=candidate.chat_id,
+                message_id=candidate.message_id,
+                source_name=candidate.source_name,
+                source_username=candidate.source_username,
+                source_sender=candidate.source_sender,
+                source_time=candidate.source_time,
+                source_text=candidate.source_text,
+                bot_reply=candidate.bot_reply,
+                retry_after=_next_checkin_suggestion_midnight(now),
+                retry_count=0,
+                last_error=_safe_error(exc),
+            )
+        )
+
+    def _retry_deferred_checkin_suggestions(self, now: dt.datetime) -> None:
+        for saved in self.archive.due_deferred_checkin_suggestions(now):
+            candidate_key = (saved.chat_id, saved.message_id)
+            if candidate_key in self._checkin_suggestion_candidates:
+                continue
+            if _checkin_suggestion_expired(
+                saved.source_time, max_age=CHECKIN_SUGGESTION_DEFERRED_MAX_AGE
+            ):
+                self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                log.info("Dropping expired deferred check-in suggestion candidate=%s", candidate_key)
+                continue
+            day = now.date()
+            if (
+                saved.chat_id in self._checkin_configs()
+                or self._checkin_suggestion_ignored(saved.chat_id, day)
+            ):
+                self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                continue
+            self.archive.reschedule_deferred_checkin_suggestion(
+                *candidate_key, _next_checkin_suggestion_midnight(now)
+            )
+            self._checkin_suggestion_candidates[candidate_key] = CheckinSuggestionCandidate(
+                chat_id=saved.chat_id,
+                message_id=saved.message_id,
+                source_name=saved.source_name,
+                source_username=saved.source_username,
+                source_sender=saved.source_sender,
+                source_time=saved.source_time,
+                source_text=saved.source_text,
+                bot_reply=saved.bot_reply,
+            )
+            task = asyncio.create_task(
+                self._analyze_checkin_suggestion(candidate_key, wait_for_bot_reply=False, deferred=True),
+                name="deferred-checkin-suggestion",
+            )
+            self._checkin_suggestion_tasks.add(task)
+            task.add_done_callback(self._checkin_suggestion_tasks.discard)
 
     async def _checkin_ai_unavailable(self) -> bool:
         primary_model = getattr(self.settings, "llm_model", "")
@@ -2148,6 +2228,7 @@ class TelegramInsightService:
         while True:
             now = dt.datetime.now(zone)
             await self._run_due_checkins(now)
+            self._retry_deferred_checkin_suggestions(now)
             await self._maybe_send_checkin_report(now)
             day_key = now.date().isoformat()
             attempt_day = self.archive.get_state("digest_attempt_day")
@@ -2580,14 +2661,26 @@ def _checkin_status_available(payload: Any, models: Sequence[str]) -> bool | Non
     )
 
 
-def _checkin_suggestion_expired(source_time: dt.datetime) -> bool:
+def _checkin_suggestion_expired(
+    source_time: dt.datetime, *, max_age: dt.timedelta = CHECKIN_SUGGESTION_MAX_AGE
+) -> bool:
     now = dt.datetime.now(dt.timezone.utc)
     timestamp = source_time
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
     else:
         timestamp = timestamp.astimezone(dt.timezone.utc)
-    return now - timestamp > CHECKIN_SUGGESTION_MAX_AGE
+    return now - timestamp > max_age
+
+
+def _next_checkin_suggestion_midnight(now: dt.datetime) -> dt.datetime:
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    return dt.datetime.combine(now.date() + dt.timedelta(days=1), dt.time.min, tzinfo=now.tzinfo)
+
+
+def _is_deferred_checkin_ai_error(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 404
 
 
 def _is_retryable_checkin_ai_error(exc: Exception) -> bool:

@@ -41,7 +41,9 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   exchange represents a real reusable check-in. The private management Bot shows
   the source message, sender/time/link, Bot reply, AI reason, and exact proposed
   command. Only “同意并部署” creates the default 00:30 automatic check-in; “忽略”
-  does nothing.
+  does nothing. A model `404` for a verified candidate is retained in a dedicated
+  SQLite queue and retried together at the next UTC+8 midnight; completed,
+  ignored, configured, or seven-day-old candidates are removed.
 - Check-in evidence is monitored in every joined group, including groups not
   selected for archiving. Unselected groups are not written to the message
   database: their candidate message and Bot reply exist only in memory until the

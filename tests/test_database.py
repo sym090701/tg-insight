@@ -1,7 +1,7 @@
 import datetime as dt
 from types import SimpleNamespace
 
-from tg_insight.database import Archive, StoredMessage
+from tg_insight.database import Archive, DeferredCheckinSuggestion, StoredMessage
 
 
 NOW = dt.datetime(2026, 8, 18, 12, 0, tzinfo=dt.timezone.utc)
@@ -81,6 +81,40 @@ def test_delete_and_state(tmp_path) -> None:
     assert archive.get_state("last_digest_day") is None
     archive.set_state("last_digest_day", "2026-08-18")
     assert archive.get_state("last_digest_day") == "2026-08-18"
+
+
+def test_deferred_checkin_suggestions_are_durable_and_rescheduled(tmp_path) -> None:
+    archive = make_archive(tmp_path)
+    archive.initialize()
+    suggestion = DeferredCheckinSuggestion(
+        chat_id=-1001234567890,
+        message_id=77,
+        source_name="签到群",
+        source_username="daily_group",
+        source_sender="Alice",
+        source_time=NOW,
+        source_text="/qd",
+        bot_reply="签到成功",
+        retry_after=NOW + dt.timedelta(hours=1),
+        retry_count=0,
+        last_error="HTTP 404",
+    )
+    archive.defer_checkin_suggestion(suggestion)
+
+    assert archive.due_deferred_checkin_suggestions(NOW + dt.timedelta(minutes=59)) == []
+    due = archive.due_deferred_checkin_suggestions(NOW + dt.timedelta(hours=1))
+    assert len(due) == 1
+    assert due[0].source_text == "/qd"
+    assert due[0].retry_count == 0
+
+    next_retry = NOW + dt.timedelta(days=1)
+    archive.reschedule_deferred_checkin_suggestion(-1001234567890, 77, next_retry)
+    rescheduled = archive.due_deferred_checkin_suggestions(next_retry)
+    assert rescheduled[0].retry_count == 1
+    assert rescheduled[0].retry_after == next_retry
+
+    archive.delete_deferred_checkin_suggestion(-1001234567890, 77)
+    assert archive.due_deferred_checkin_suggestions(next_retry + dt.timedelta(days=1)) == []
 
 
 def test_archive_evicts_oldest_messages_at_hard_limit(tmp_path) -> None:
