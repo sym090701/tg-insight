@@ -7,6 +7,7 @@ import os
 
 from . import __version__
 from .config import ConfigError, Settings
+from .health import is_healthy
 from .service import TelegramInsightService
 
 
@@ -18,6 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--phone", default=os.environ.get("TG_PHONE"))
     subcommands.add_parser("run", help="Run archive, bot and scheduler")
     subcommands.add_parser("check-config", help="Validate environment configuration")
+    subcommands.add_parser("healthcheck", help="Check whether the running service is ready")
     return parser
 
 
@@ -35,6 +37,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     args = build_parser().parse_args()
+    if args.command == "healthcheck":
+        raise SystemExit(0 if is_healthy() else 1)
     try:
         settings = Settings.from_env()
     except ConfigError as exc:

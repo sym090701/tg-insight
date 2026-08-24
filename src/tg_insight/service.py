@@ -17,6 +17,7 @@ from telethon import Button, TelegramClient, events, functions, types
 
 from .config import Settings
 from .database import Archive, DeferredCheckinSuggestion, StoredMessage
+from .health import clear_health, mark_healthy
 from .llm import (
     CONTENT_CATEGORIES,
     CheckinSuggestionDecision,
@@ -66,6 +67,9 @@ CHECKIN_SUGGESTION_RETRY_INITIAL_SECONDS = 30
 CHECKIN_SUGGESTION_RETRY_MAX_SECONDS = 15 * 60
 CHECKIN_SUGGESTION_MAX_AGE = dt.timedelta(hours=24)
 CHECKIN_SUGGESTION_DEFERRED_MAX_AGE = dt.timedelta(days=7)
+SYNC_RECONCILE_INTERVAL_SECONDS = 10 * 60
+SYNC_RECONCILE_MESSAGE_LIMIT = 200
+HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15
 CHECKIN_SUCCESS_KEYWORDS = (
     "签到成功",
     "已签到",
@@ -206,6 +210,7 @@ class TelegramInsightService:
         self._user_id: int | None = None
 
     async def run(self) -> None:
+        clear_health()
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.archive.initialize()
         await self.user.connect()
@@ -219,20 +224,42 @@ class TelegramInsightService:
         await self._resolve_sources()
         self._register_handlers()
         await self._set_bot_commands()
+        # The clients are already connected, so enqueue missed updates only after
+        # handlers are installed. This avoids dropping restart-window updates.
+        await self.user.catch_up()
+        await self.bot.catch_up()
 
         await self._backfill()
         await self._classify_sources(tuple(self.sources.values()))
         self.archive.prune(self.settings.retention_days)
         scheduler = asyncio.create_task(self._scheduler(), name="daily-digest")
+        reconciler = asyncio.create_task(
+            self._sync_reconciler(), name="telegram-reconciliation"
+        )
+        heartbeat = asyncio.create_task(
+            self._heartbeat(), name="service-heartbeat"
+        )
+        user_runner = asyncio.create_task(
+            self.user.run_until_disconnected(), name="user-client"
+        )
+        bot_runner = asyncio.create_task(
+            self.bot.run_until_disconnected(), name="bot-client"
+        )
         log.info("Service ready with %d source chats", len(self.sources))
         try:
-            await asyncio.gather(
-                self.user.run_until_disconnected(),
-                self.bot.run_until_disconnected(),
-                scheduler,
+            done, _ = await asyncio.wait(
+                (user_runner, bot_runner, scheduler, reconciler, heartbeat),
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            completed = next(iter(done))
+            exception = completed.exception()
+            if exception is not None:
+                raise exception
+            raise RuntimeError(f"{completed.get_name()} stopped unexpectedly")
         finally:
-            scheduler.cancel()
+            clear_health()
+            for task in (scheduler, reconciler, heartbeat, user_runner, bot_runner):
+                task.cancel()
             for task in self._backfill_tasks:
                 task.cancel()
             for task in self._classification_tasks:
@@ -245,6 +272,10 @@ class TelegramInsightService:
             await asyncio.gather(*self._classification_tasks, return_exceptions=True)
             await asyncio.gather(*self._alert_tasks, return_exceptions=True)
             await asyncio.gather(*self._checkin_suggestion_tasks, return_exceptions=True)
+            await asyncio.gather(
+                scheduler, reconciler, heartbeat, user_runner, bot_runner,
+                return_exceptions=True,
+            )
             await self.user.disconnect()
             await self.bot.disconnect()
 
@@ -460,6 +491,31 @@ class TelegramInsightService:
                 if await self._store_telegram_message(source, message):
                     count += 1
             log.info("Backfilled %d messages from %s", count, source.name)
+
+    async def _sync_reconciler(self) -> None:
+        while True:
+            await asyncio.sleep(SYNC_RECONCILE_INTERVAL_SECONDS)
+            inserted = 0
+            for source in tuple(self.sources.values()):
+                try:
+                    async for message in self.user.iter_messages(
+                        source.entity, limit=SYNC_RECONCILE_MESSAGE_LIMIT
+                    ):
+                        if await self._store_telegram_message(source, message):
+                            inserted += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.warning("Recent-message reconciliation failed for chat id=%s", source.chat_id)
+            log.info("Reconciled recent messages; inserted=%d", inserted)
+
+    async def _heartbeat(self) -> None:
+        while True:
+            if not self.user.is_connected() or not self.bot.is_connected():
+                clear_health()
+                raise RuntimeError("Telegram client disconnected")
+            mark_healthy()
+            await asyncio.sleep(HEALTH_HEARTBEAT_INTERVAL_SECONDS)
 
     async def _on_help(self, event: Any) -> None:
         if not await self._private_authorized(event):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tg-insight"
-version = "0.1.28"
+version = "0.1.29"
 description = "Lightweight Telegram group archive, daily digest, and grounded history Q&A"
 requires-python = ">=3.12"
 dependencies = [

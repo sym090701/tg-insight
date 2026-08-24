@@ -1,7 +1,7 @@
 services:
   tg-insight:
     build: .
-    image: tg-insight:0.1.28
+    image: tg-insight:0.1.29
     container_name: tg-insight
     command: ["run"]
     restart: unless-stopped
@@ -27,3 +27,9 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+    healthcheck:
+      test: ["CMD", "tg-insight", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10m
