@@ -78,13 +78,21 @@ CHECKIN_SUCCESS_KEYWORDS = (
 )
 CHECKIN_FAILURE_KEYWORDS = ("签到失败", "操作失败", "请稍后重试", "无权限", "已过期")
 ALERT_EVENT_HINTS = (
-    "紧急", "重要通知", "故障", "中断", "截止", "封禁", "下架", "涨价", "降价",
-    "维护", "漏洞", "攻击", "泄露", "发布", "报名", "活动", "规则更新", "breaking",
+    "服务中断", "系统宕机", "安全漏洞", "数据泄露", "账户被盗", "资产风险", "封禁",
+    "关停", "下架", "紧急维护", "政策调整", "价格调整", "报名截止", "重大公告",
 )
-ALERT_KEYWORDS_DEFAULT = "紧急,重要通知,故障,截止,封禁,下架,涨价,维护,漏洞,攻击,泄露,发布,报名"
+ALERT_KEYWORDS_DEFAULT = (
+    "服务中断,系统宕机,安全漏洞,数据泄露,账户被盗,资产风险,封禁,关停,下架,"
+    "紧急维护,政策调整,价格调整,报名截止,重大公告"
+)
 ALERT_CONTEXT_MESSAGES = 12
 ALERT_MAX_MESSAGE_AGE = dt.timedelta(minutes=45)
-ALERT_TOPIC_COOLDOWN = dt.timedelta(minutes=15)
+ALERT_TOPIC_COOLDOWN = dt.timedelta(hours=1)
+ALERT_MIN_CANDIDATE_LENGTH = 16
+ALERT_NOISE_MARKERS = (
+    "有人知道", "请问", "求问", "怎么", "是否", "有没有", "听说", "据说", "传闻",
+    "例行", "周报", "日报", "活动预告", "教程", "闲聊", "讨论", "复盘", "回顾",
+)
 TOPIC_SUBSCRIPTION_COOLDOWN = dt.timedelta(minutes=30)
 MAX_TOPIC_SUBSCRIPTIONS = 20
 CHECKIN_COMMAND_PATTERN = re.compile(
@@ -595,7 +603,7 @@ class TelegramInsightService:
             "重大事件提醒\n"
             f"状态：{'开启' if enabled else '关闭'}\n"
             f"关键词：{', '.join(keywords)}\n"
-            "命中关键词会立即提醒；同时对少量事件线索使用 AI 复核，避免普通聊天打扰。"
+            "仅明确风险、影响或硬截止会进入 AI 复核；疑问、传闻、例行通知和讨论不会推送。"
         )
         return text, [
             [Button.inline("关闭提醒" if enabled else "开启提醒", data=b"ka")],
@@ -1939,28 +1947,22 @@ class TelegramInsightService:
             return
         source = self.sources.get(getattr(event, "chat_id", None))
         text = (getattr(event, "raw_text", "") or "").strip()
-        if source is None or len(text) < 8:
+        if source is None or len(text) < ALERT_MIN_CANDIDATE_LENGTH:
             return
         message_time = _event_message_time(event)
         now = dt.datetime.now(dt.timezone.utc)
         if now - message_time > ALERT_MAX_MESSAGE_AGE:
             return
         lowered = text.casefold()
-        signals = (
-            tuple(
-                signal
-                for signal in (*keywords, *ALERT_EVENT_HINTS)
-                if signal.casefold() in lowered
-            )
-            if enabled
-            else ()
-        )
+        signals = _matching_alert_signals(lowered, keywords) if enabled else ()
         topic_match = any(
             int(item["chat_id"]) == source.chat_id
             and str(item["keyword"]).casefold() in lowered
             for item in subscriptions
         )
         if not signals and not topic_match:
+            return
+        if signals and not _is_alert_candidate(text, signals):
             return
         task = asyncio.create_task(
             self._analyze_alert(source, text, event, signals), name="ai-event-alert"
@@ -2708,7 +2710,7 @@ def _telegram_message_link(chat_id: int, username: str | None, message_id: int) 
 
 def _parse_alert_keywords(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
-        values = re.split(r"[,，\\n]", value)
+        values = re.split(r"[,，\n]", value)
     elif isinstance(value, (list, tuple)):
         values = value
     else:
@@ -2716,9 +2718,27 @@ def _parse_alert_keywords(value: Any) -> tuple[str, ...]:
     result: list[str] = []
     for item in values:
         text = " ".join(str(item).split())[:40]
+        if text.startswith("/"):
+            continue
         if text and text.casefold() not in {value.casefold() for value in result}:
             result.append(text)
     return tuple(result[:20])
+
+
+def _matching_alert_signals(text: str, keywords: Sequence[str]) -> tuple[str, ...]:
+    matches: list[str] = []
+    for signal in (*keywords, *ALERT_EVENT_HINTS):
+        normalized = signal.casefold()
+        if normalized in text and normalized not in {item.casefold() for item in matches}:
+            matches.append(signal)
+    return tuple(matches)
+
+
+def _is_alert_candidate(text: str, signals: Sequence[str]) -> bool:
+    normalized = " ".join(text.casefold().split())
+    if not signals or normalized.endswith(("?", "？")):
+        return False
+    return not any(marker in normalized for marker in ALERT_NOISE_MARKERS)
 
 
 def _checkin_suggestion_text(value: str | None, chat_id: int) -> str:

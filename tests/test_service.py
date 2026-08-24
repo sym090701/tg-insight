@@ -42,6 +42,9 @@ from tg_insight.service import (
     _checkin_suggestion_retry_delay,
     _checkin_suggestion_expired,
     _next_checkin_suggestion_midnight,
+    _is_alert_candidate,
+    _matching_alert_signals,
+    _parse_alert_keywords,
     _checkin_status_available,
     _redact_for_llm,
     _redact_messages,
@@ -390,7 +393,7 @@ async def test_group_page_bulk_selection_persists_and_skips_fixed_sources() -> N
 
 
 @pytest.mark.asyncio
-async def test_keyword_alert_candidate_is_reviewed_by_ai_before_sending() -> None:
+async def test_high_signal_alert_candidate_is_reviewed_by_ai_before_sending() -> None:
     class Archive:
         def recent(self, _chat_ids, _limit):
             return []
@@ -416,11 +419,11 @@ async def test_keyword_alert_candidate_is_reviewed_by_ai_before_sending() -> Non
     service._alert_tasks = set()
     service._alert_last_sent = {}
     service._alert_lock = asyncio.Lock()
-    service._alert_config = lambda: (True, ("发布",))
+    service._alert_config = lambda: (True, ("服务中断",))
     event = SimpleNamespace(
         is_group=True,
         chat_id=1,
-        raw_text="明天发布例行周报，请大家关注。",
+        raw_text="官方公告：支付服务中断，受影响用户请等待恢复通知。",
         message=SimpleNamespace(id=5, date=dt.datetime.now(dt.timezone.utc)),
     )
 
@@ -428,7 +431,39 @@ async def test_keyword_alert_candidate_is_reviewed_by_ai_before_sending() -> Non
     await asyncio.gather(*tuple(service._alert_tasks))
 
     assert len(service.llm.calls) == 1
-    assert service.llm.calls[0][0:2] == ("群组", "明天发布例行周报，请大家关注。")
+    assert service.llm.calls[0][0:2] == ("群组", "官方公告：支付服务中断，受影响用户请等待恢复通知。")
+
+
+@pytest.mark.asyncio
+async def test_alert_questions_and_routine_discussion_do_not_reach_ai() -> None:
+    class LLM:
+        async def detect_event(self, *_args):
+            raise AssertionError("noise must be filtered before AI analysis")
+
+    service = object.__new__(TelegramInsightService)
+    service.sources = {1: SourceChat(entity=object(), chat_id=1, name="群组", username=None)}
+    service._alert_config = lambda: (True, ("服务中断",))
+    service._topic_subscriptions = lambda: []
+    service._alert_tasks = set()
+    service.llm = LLM()
+    event = SimpleNamespace(
+        is_group=True,
+        chat_id=1,
+        raw_text="有人知道支付服务中断是否已经恢复了吗？",
+        message=SimpleNamespace(id=5, date=dt.datetime.now(dt.timezone.utc)),
+    )
+
+    await service._schedule_alert_analysis(event)
+
+    assert not service._alert_tasks
+
+
+def test_alert_keyword_parser_ignores_bot_commands_and_deduplicates_signals() -> None:
+    assert _parse_alert_keywords("/alerts,服务中断\n安全漏洞") == ("服务中断", "安全漏洞")
+    assert _matching_alert_signals(
+        "官方公告：支付服务中断", ("服务中断", "服务中断")
+    ) == ("服务中断",)
+    assert not _is_alert_candidate("这是例行服务中断演练的周报", ("服务中断",))
 
 
 @pytest.mark.asyncio
