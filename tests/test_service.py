@@ -786,6 +786,27 @@ async def test_deferred_checkin_suggestion_replays_when_due() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bot_command_menu_is_available_to_all_client_languages() -> None:
+    requests = []
+
+    class Bot:
+        async def __call__(self, request):
+            requests.append(request)
+
+    service = object.__new__(TelegramInsightService)
+    service.bot = Bot()
+
+    await service._set_bot_commands()
+
+    assert len(requests) == 1
+    assert requests[0].lang_code == ""
+    assert [command.command for command in requests[0].commands] == [
+        "groups", "recent", "ask", "summary", "content", "checkin", "alerts",
+        "topics", "refresh", "backup", "settings", "status", "help",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_checkin_suggestion_status_unavailable_does_not_call_ai(monkeypatch) -> None:
     class LLM:
         async def assess_checkin_suggestion(self, *_args):

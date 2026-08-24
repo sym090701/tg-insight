@@ -2348,7 +2348,9 @@ class TelegramInsightService:
         await self.bot(
             functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopeDefault(),
-                lang_code="en",
+                # An empty language code is Telegram's universal command menu.
+                # Restricting this to "en" hides it for Chinese-language clients.
+                lang_code="",
                 commands=[
                     types.BotCommand(command="groups", description="选择要归档的群组"),
                     types.BotCommand(command="recent", description="读取指定群组的最近消息"),
