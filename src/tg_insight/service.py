@@ -71,6 +71,7 @@ CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
 CHECKIN_SUGGESTION_IGNORES_STATE = "checkin_suggestion_ignores"
 TOPIC_SUBSCRIPTIONS_STATE = "topic_subscriptions"
 DIGEST_CURSORS_STATE = "digest_cursors"
+LANGUAGE_STATE = "bot_language"
 CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
 CHECKIN_SUGGESTION_STATUS_URL = "https://status.input.im/api/status"
 CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS = 8
@@ -137,6 +138,159 @@ MAX_TOPIC_SUBSCRIPTIONS = 20
 CHECKIN_COMMAND_PATTERN = re.compile(
     r"(?<![a-z0-9_])/(?:qd|checkin)(?:@[a-z0-9_]{5,})?(?![a-z0-9_])", re.IGNORECASE
 )
+
+
+_EN_TRANSLATIONS = (
+    ("请选择语言", "Choose a language"),
+    ("选择语言", "Choose language"),
+    ("中文", "Chinese"),
+    ("英文", "English"),
+    ("语言已切换为中文。", "Language switched to Chinese."),
+    ("语言已切换为 English。", "Language switched to English."),
+    ("语言设置", "Language settings"),
+    ("可用命令：", "Available commands:"),
+    ("分页多选要归档的已加入群组", "Paginated selection of joined groups to archive"),
+    ("选择群组并读取最近消息", "Choose a group and read recent messages"),
+    ("查询已归档的群聊历史", "Query archived group history"),
+    ("立即生成过去 24 小时摘要", "Generate a summary of the last 24 hours"),
+    ("识别内容类型并排除成人群摘要", "Classify content and exclude adult groups from summaries"),
+    ("管理自动签到", "Manage automatic check-ins"),
+    ("配置重大事件提醒", "Configure major-event alerts"),
+    ("管理关键词话题订阅", "Manage keyword topic subscriptions"),
+    ("重新扫描群组和机器人", "Rescan groups and bots"),
+    ("导出不含凭据的消息数据库", "Export the message database without credentials"),
+    ("设置每日推送时间和开关", "Set the daily delivery time and toggle"),
+    ("查看归档和定时任务状态", "View archive and scheduler status"),
+    ("手动重试等待中的签到识别", "Manually retry pending check-in analysis"),
+    ("也可以直接私聊发送问题。群组选择和最近消息仅在私聊中可用。", "You can also send a question directly. Group selection and recent messages are available in private chat only."),
+    ("无权访问。", "Access denied."),
+    ("请私聊机器人使用此命令。", "Please use this command in a private chat with the bot."),
+    ("正在生成过去 24 小时摘要...", "Generating the summary for the last 24 hours..."),
+    ("暂无选择的归档群，使用 /groups 添加。", "No archived groups selected. Use /groups to add one."),
+    ("正在重新扫描 Telegram 对话列表...", "Rescanning Telegram dialogs..."),
+    ("扫描完成：发现", "Scan complete: found"),
+    ("个可签到群组或机器人。", " check-in groups or bots."),
+    ("正在生成一致性数据库备份，请稍候...", "Creating a consistent database backup, please wait..."),
+    ("备份失败，请检查服务日志。", "Backup failed. Check the service logs."),
+    ("正在检索历史消息...", "Searching archived messages..."),
+    ("查询失败，已加入 AI 重试队列；模型恢复后会自动重试。", "The query failed and was queued for AI retry; it will retry when the model recovers."),
+    ("操作无效，请重新发送命令。", "Invalid action. Please send the command again."),
+    ("操作失败，请检查服务日志。", "Action failed. Check the service logs."),
+    ("上一页", "Previous"),
+    ("下一页", "Next"),
+    ("返回", "Back"),
+    ("完成", "Done"),
+    ("刷新群组和机器人", "Refresh groups and bots"),
+    ("添加签到目标", "Add check-in target"),
+    ("更改推送时间", "Change delivery time"),
+    ("开启每日推送", "Enable daily delivery"),
+    ("关闭每日推送", "Disable daily delivery"),
+    ("更改签到文本", "Change check-in text"),
+    ("更改签到时间", "Change check-in time"),
+    ("设置 Topic", "Set topic"),
+    ("立即签到", "Check in now"),
+    ("移除签到目标", "Remove check-in target"),
+    ("查看签到记录", "View check-in history"),
+    ("返回列表", "Back to list"),
+    ("返回配置", "Back to configuration"),
+    ("开启自动签到", "Enable automatic check-in"),
+    ("关闭自动签到", "Disable automatic check-in"),
+    ("重新分析本页", "Reanalyze this page"),
+    ("重新分析所有群", "Reanalyze all groups"),
+    ("全选本页", "Select page"),
+    ("清除本页", "Clear page"),
+    ("选择已保存，后台回填会继续进行。", "Selection saved. Backfill will continue in the background."),
+    ("已保存", "Saved"),
+    ("已加入归档，后台开始回填。", "Added to archive. Backfill started in the background."),
+    ("已取消归档。", "Removed from archive."),
+    ("此群由配置固定，不能在机器人中移除。", "This group is fixed by configuration and cannot be removed here."),
+    ("摘要排除的成人群", "adult groups excluded from summaries"),
+    ("来源群组", "Source groups"),
+    ("可选择群组", "Selectable groups"),
+    ("后台回填任务", "Background backfill tasks"),
+    ("每日推送", "Daily delivery"),
+    ("每日摘要", "Daily summary"),
+    ("自动签到", "Automatic check-in"),
+    ("重大事件提醒", "Major-event alerts"),
+    ("话题订阅", "Topic subscriptions"),
+    ("AI 模型", "AI model"),
+    ("开启", "Enabled"),
+    ("关闭", "Disabled"),
+    ("尚未签到", "Not checked in yet"),
+    ("尚未执行", "Not run yet"),
+    ("无", "None"),
+    ("主聊天", "Main chat"),
+    ("群组", "Group"),
+    ("机器人", "Bot"),
+    ("请选择", "Please choose"),
+    ("每日推送已开启。", "Daily delivery enabled."),
+    ("每日推送已关闭。", "Daily delivery disabled."),
+    ("重大事件提醒已开启。", "Major-event alerts enabled."),
+    ("重大事件提醒已关闭。", "Major-event alerts disabled."),
+    ("自动签到已开启。", "Automatic check-in enabled."),
+    ("自动签到已关闭。", "Automatic check-in disabled."),
+    ("正在生成过去 24 小时摘要...", "Generating the summary for the last 24 hours..."),
+    ("正在生成一致性数据库备份，请稍候...", "Creating a consistent database backup, please wait..."),
+    ("正在检索历史消息...", "Searching archived messages..."),
+    ("正在重新扫描 Telegram 对话列表...", "Rescanning Telegram dialogs..."),
+    ("正在重新扫描 Telegram 对话...", "Rescanning Telegram dialogs..."),
+    ("正在发送签到...", "Sending check-in..."),
+    ("已手动触发", "Manually triggered"),
+    ("个待处理 AI 任务的重试。", " pending AI task retries."),
+    ("暂无选择的归档群，使用 /groups 添加。", "No archived groups selected. Use /groups to add one."),
+    ("该签到目标不存在。", "That check-in target does not exist."),
+    ("推送对象：仅当前配置的本人私聊", "Delivery target: your configured private chat only"),
+    ("时区固定为 UTC+8。", "The timezone is fixed at UTC+8."),
+    ("上次状态：", "Last status: "),
+    ("详情：", "Details: "),
+    ("文本：", "Text: "),
+    ("时间：", "Time: "),
+    ("状态：", "Status: "),
+    ("关键词：", "Keywords: "),
+    ("检测到可复用的签到操作，请确认是否部署。", "Reusable check-in action detected. Confirm deployment."),
+    ("源消息", "Source message"),
+    ("Bot 回复", "Bot reply"),
+    ("AI 判断（高置信）", "AI assessment (high confidence)"),
+    ("建议自动发送", "Suggested recurring message"),
+    ("来源链接", "Source link"),
+    ("同意并部署", "Approve and deploy"),
+    ("今天忽略", "Ignore today"),
+    ("7 天忽略", "Ignore for 7 days"),
+    ("永久忽略", "Ignore permanently"),
+    ("忽略此主题", "Ignore this topic"),
+    ("重要", "Important"),
+    ("反馈已保存。", "Feedback saved."),
+    ("订阅已移除。", "Subscription removed."),
+    ("添加订阅", "Add subscription"),
+    ("修改关键词", "Edit keywords"),
+    ("签到目标已添加。", "Check-in target added."),
+    ("签到目标已移除。", "Check-in target removed."),
+    ("签到日报", "Check-in report"),
+    ("自动签到失败", "Automatic check-in failed"),
+    ("继续保留", "Keep enabled"),
+    ("关闭自动签到", "Disable automatic check-in"),
+    ("暂无记录。", "No records."),
+    ("暂无可管理的归档群。", "No archived groups to manage."),
+    ("未发现可选择的群组或机器人。", "No selectable groups or bots found."),
+    ("过去 24 小时没有可参与摘要的归档消息。", "No archived messages are available for the last-24-hour summary."),
+    ("正在重新分析本页群组。稍后发送 /content 查看结果。", "Groups on this page are being reanalyzed. Use /content later to view results."),
+    ("所有归档群正在后台重新分析。稍后发送 /content 查看结果。", "All archived groups are being reanalyzed in the background. Use /content later to view results."),
+)
+
+
+def _localize_text(text: str, language: str | None) -> str:
+    if language != "en" or not text:
+        return text
+    result = text
+    result = re.sub(r"选择归档群组（已选\s*(\d+)\s*个，第\s*(\d+)/(\d+)\s*页）：", r"Select groups to archive (selected \1, Page \2/\3):", result)
+    result = re.sub(r"正在读取\s*(.+?)\s*的最近消息\.\.\.", r"Reading recent messages from \1...", result)
+    result = re.sub(r"选择要读取最近\s*(\d+)\s*条消息的群组（第\s*(\d+)/(\d+)\s*页）：", r"Choose a group to read the last \1 messages (Page \2/\3):", result)
+    for source, target in sorted(_EN_TRANSLATIONS, key=lambda item: len(item[0]), reverse=True):
+        result = result.replace(source, target)
+    result = result.replace("：", ": ").replace("（", "(").replace("）", ")")
+    result = re.sub(r"第\s*(\d+)\s*/\s*(\d+)\s*页", r"Page \1/\2", result)
+    result = re.sub(r"第\s*(\d+)\s*页", r"Page \1", result)
+    return result
 
 
 @dataclass(frozen=True)
@@ -249,9 +403,11 @@ class TelegramInsightService:
         self._ai_retry_last_status: bool | None = None
         self._ai_retry_tasks: set[asyncio.Task[None]] = set()
         self._user_id: int | None = None
+        self._require_language = False
 
     async def run(self) -> None:
         clear_health()
+        self._require_language = True
         log.info(
             "Service starting timezone=%s backfill_days=%d summary_time=%02d:%02d",
             self.settings.timezone,
@@ -261,6 +417,7 @@ class TelegramInsightService:
         )
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.archive.initialize()
+        self.llm.output_language = self._language() or "zh"
         await self.user.connect()
         if not await self.user.is_user_authorized():
             raise RuntimeError("Telegram user session is not authorized; run auth first")
@@ -478,7 +635,7 @@ class TelegramInsightService:
         self.bot.add_event_handler(
             self._on_group_callback,
             events.CallbackQuery(
-            pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx|ku|kv|kw|tp|td|ti|af|ro)(?::|$)|(?:s|st|sd)$)"
+            pattern=rb"^(?:(?:lang|sl|g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx|ku|kv|kw|tp|td|ti|af|ro)(?::|$)|(?:s|st|sd)$)"
             ),
         )
         self.bot.add_event_handler(self._on_private_text, events.NewMessage(incoming=True))
@@ -593,6 +750,11 @@ class TelegramInsightService:
     async def _on_help(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        if self._language() is None:
+            text, buttons = self._language_picker()
+            await event.reply(text, buttons=buttons)
+            return
+        event = self._localized_event(event)
         await event.reply(
             "可用命令：\n"
             "/groups - 分页多选要归档的已加入群组\n"
@@ -611,9 +773,85 @@ class TelegramInsightService:
             "也可以直接私聊发送问题。群组选择和最近消息仅在私聊中可用。"
         )
 
+    def _language(self) -> str | None:
+        getter = getattr(getattr(self, "archive", None), "get_state", None)
+        value = getter(LANGUAGE_STATE) if getter is not None else None
+        return value if value in {"zh", "en"} else None
+
+    def _set_language(self, language: str) -> None:
+        if language not in {"zh", "en"}:
+            raise ValueError("unsupported language")
+        self.archive.set_state(LANGUAGE_STATE, language)
+        # The LLM instance is shared by all handlers; this keeps generated
+        # summaries and alerts aligned with the selected Bot language.
+        if hasattr(self.llm, "output_language"):
+            self.llm.output_language = language
+
+    def _language_picker(self) -> tuple[str, list[list[Any]]]:
+        return (
+            "请选择语言 / Choose a language",
+            [
+                [Button.inline("中文", data=b"lang:zh"), Button.inline("English", data=b"lang:en")]
+            ],
+        )
+
+    def _text(self, text: str) -> str:
+        return _localize_text(text, self._language())
+
+    def _localized_event(self, event: Any) -> Any:
+        language = self._language()
+        return _LocalizedEvent(event, language) if language else event
+
+    def _button(self, label: str, data: bytes) -> Any:
+        return Button.inline(self._text(label), data=data)
+
+    async def _reply(self, event: Any, text: str, **kwargs: Any) -> Any:
+        if "buttons" not in kwargs:
+            return await event.reply(self._text(text), **kwargs)
+        return await event.reply(self._text(text), buttons=self._localize_buttons(kwargs["buttons"]), **{k: v for k, v in kwargs.items() if k != "buttons"})
+
+    async def _edit(self, event: Any, text: str, **kwargs: Any) -> Any:
+        if "buttons" not in kwargs:
+            return await event.edit(self._text(text), **kwargs)
+        return await event.edit(self._text(text), buttons=self._localize_buttons(kwargs["buttons"]), **{k: v for k, v in kwargs.items() if k != "buttons"})
+
+    async def _answer(self, event: Any, text: str = "", **kwargs: Any) -> Any:
+        return await event.answer(self._text(text), **kwargs)
+
+    def _localize_buttons(self, buttons: Any) -> Any:
+        if not buttons:
+            return buttons
+        return [
+            [
+                Button.inline(
+                    _localize_text(getattr(button, "text", ""), self._language()),
+                    data=getattr(button, "data", b""),
+                )
+                for button in row
+            ]
+            for row in buttons
+        ]
+
+    async def _send_bot_message(self, target: int | str, text: str, **kwargs: Any) -> Any:
+        if getattr(self, "_require_language", False) and self._language() is None:
+            log.info("Skipping proactive Bot message until a language is selected")
+            return None
+        if "buttons" in kwargs:
+            kwargs["buttons"] = self._localize_buttons(kwargs["buttons"])
+        return await self.bot.send_message(target, self._text(text), **kwargs)
+
+    async def _send_bot_file(self, target: int | str, path: Any, **kwargs: Any) -> Any:
+        if getattr(self, "_require_language", False) and self._language() is None:
+            log.info("Skipping proactive Bot file until a language is selected")
+            return None
+        if isinstance(kwargs.get("caption"), str):
+            kwargs["caption"] = self._text(kwargs["caption"])
+        return await self.bot.send_file(target, path, **kwargs)
+
     async def _on_status(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         count = self.archive.count(tuple(self.sources))
         overrides, classifications = self._content_state()
         adult_count = sum(
@@ -652,6 +890,7 @@ class TelegramInsightService:
     async def _on_retry(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         checkin_status, checkin_count = await self._retry_deferred_checkin_suggestions(
             dt.datetime.now(ZoneInfo(self.settings.timezone)), force=True
         )
@@ -670,6 +909,7 @@ class TelegramInsightService:
     async def _on_summary(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         if not self.sources:
             await event.reply("暂无选择的归档群，使用 /groups 添加。")
             return
@@ -679,6 +919,7 @@ class TelegramInsightService:
     async def _on_settings(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         self._pending_schedule_users.discard(event.sender_id)
         text, buttons = self._settings_picker()
         await event.reply(text, buttons=buttons)
@@ -686,11 +927,13 @@ class TelegramInsightService:
     async def _on_content(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         await self._send_group_picker(event, mode="content", page=0)
 
     async def _on_checkin(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         self._pending_checkin_text_users.pop(event.sender_id, None)
         self._pending_checkin_schedule_users.pop(event.sender_id, None)
         text, buttons = self._checkin_picker()
@@ -699,6 +942,7 @@ class TelegramInsightService:
     async def _on_refresh(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         await event.reply("正在重新扫描 Telegram 对话列表...")
         count = await self._refresh_dialogs()
         await event.reply(f"扫描完成：发现 {count} 个可签到群组或机器人。")
@@ -706,22 +950,25 @@ class TelegramInsightService:
     async def _on_alerts(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         text, buttons = self._alerts_picker()
         await event.reply(text, buttons=buttons)
 
     async def _on_topics(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         text, buttons = self._topics_picker()
         await event.reply(text, buttons=buttons)
 
     async def _on_backup(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         await event.reply("正在生成一致性数据库备份，请稍候...")
         try:
             path = await asyncio.to_thread(self._create_backup)
-            await self.bot.send_file(
+            await self._send_bot_file(
                 event.chat_id,
                 path,
                 caption="消息数据库备份。此文件不包含 .env、Telegram 会话或 API 密钥。",
@@ -743,6 +990,7 @@ class TelegramInsightService:
         buttons = [
             [Button.inline("更改推送时间", data=b"st")],
             [Button.inline("关闭每日推送" if enabled else "开启每日推送", data=b"sd")],
+            [Button.inline("更改语言", data=b"sl")],
         ]
         return text, buttons
 
@@ -939,6 +1187,7 @@ class TelegramInsightService:
     async def _on_ask(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         match = event.pattern_match
         question = match.group(1).strip() if match and match.group(1) else ""
         if not question:
@@ -949,11 +1198,13 @@ class TelegramInsightService:
     async def _on_groups(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         await self._send_group_picker(event, mode="groups", page=0)
 
     async def _on_recent(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
+        event = self._localized_event(event)
         raw_count = event.pattern_match.group(1) if event.pattern_match else None
         count = _recent_count(raw_count)
         if count is None:
@@ -1087,6 +1338,21 @@ class TelegramInsightService:
         try:
             parts = event.data.decode().split(":")
             action = parts[0]
+            if action == "lang" and len(parts) == 2:
+                self._set_language(parts[1])
+                await event.answer()
+                await event.edit(
+                    "语言已切换为中文。"
+                    if parts[1] == "zh"
+                    else "Language switched to English."
+                )
+                await self._set_bot_commands()
+                return
+            event = self._localized_event(event)
+            if action == "sl" and len(parts) == 1:
+                text, buttons = self._language_picker()
+                await event.edit(text, buttons=buttons)
+                return
             if action == "s" and len(parts) == 1:
                 text, buttons = self._settings_picker()
                 await event.edit(text, buttons=buttons)
@@ -1385,7 +1651,7 @@ class TelegramInsightService:
                 await event.answer()
                 await event.edit(f"正在读取 {source.name} 的最近消息...")
                 text = await self._recent_messages(source, count)
-                await _send_long(self.bot, text, target=event.chat_id)
+                await _send_long(self.bot, self._text(text), target=event.chat_id)
                 await event.edit("最近消息已发送，可继续用 /recent 选择其他群组。")
                 return
             if action == "c" and len(parts) == 3:
@@ -1440,6 +1706,11 @@ class TelegramInsightService:
             return
         if not await self._authorized(event, reply_denied=False):
             return
+        if self._language() is None:
+            text, buttons = self._language_picker()
+            await event.reply(text, buttons=buttons)
+            return
+        event = self._localized_event(event)
         if event.sender_id in self._pending_alert_keywords_users:
             keywords = _parse_alert_keywords(event.raw_text)
             if not keywords:
@@ -1553,7 +1824,10 @@ class TelegramInsightService:
         try:
             answer = await self._answer_question_value(question)
             await progress.delete()
-            await _send_long(event, render_answer(answer))
+            await _send_long(
+                event,
+                render_answer(answer, self._language() or "zh"),
+            )
         except Exception as exc:
             log.exception("Question answering failed")
             job_key = f"ask:{event.chat_id}:{hashlib.sha256(question.encode()).hexdigest()[:24]}"
@@ -1583,15 +1857,19 @@ class TelegramInsightService:
             return True
         log.warning("Denied bot access for user id=%s", event.sender_id)
         if reply_denied:
-            await event.reply("无权访问。")
+            await event.reply(self._text("无权访问。"))
         return False
 
     async def _private_authorized(self, event: Any) -> bool:
         if not await self._authorized(event):
             return False
         if getattr(event, "is_private", False):
+            if self._language() is None:
+                text, buttons = self._language_picker()
+                await event.reply(text, buttons=buttons)
+                return False
             return True
-        await event.reply("请私聊机器人使用此命令。")
+        await event.reply(self._text("请私聊机器人使用此命令。"))
         return False
 
     def _digest_schedule(self) -> tuple[int, int]:
@@ -2127,7 +2405,7 @@ class TelegramInsightService:
                 stamp = candidate.source_time.astimezone(ZoneInfo(self.settings.timezone)).strftime(
                     "%Y-%m-%d %H:%M %Z"
                 )
-                await self.bot.send_message(
+                await self._send_bot_message(
                     self.settings.summary_target,
                     (
                         "检测到可复用的签到操作，请确认是否部署。\n"
@@ -2307,7 +2585,11 @@ class TelegramInsightService:
                     initial_attempt=int(job.retry_count),
                 )
                 if answer is not None:
-                    await _send_long(self.bot, render_answer(answer), target=target)
+                    await _send_long(
+                        self.bot,
+                        render_answer(answer, self._language() or "zh"),
+                        target=target,
+                    )
                 return
             self.archive.delete_ai_retry_job(job.job_key)
         except Exception:
@@ -2483,7 +2765,7 @@ class TelegramInsightService:
                 f"\n升级提醒：该目标已连续失败 {config.failure_streak} 天，"
                 "请检查目标是否改名、命令是否失效或 Bot 是否异常。"
             )
-        await self.bot.send_message(
+        await self._send_bot_message(
             self.settings.summary_target,
             f"自动签到失败：{self._checkin_label(chat_id)}\n{detail[:500]}{escalation}",
             buttons=self._checkin_failure_buttons(chat_id),
@@ -2504,7 +2786,7 @@ class TelegramInsightService:
             return
         if config.unverified_streak % CHECKIN_UNVERIFIED_ESCALATION_DAYS:
             return
-        await self.bot.send_message(
+        await self._send_bot_message(
             self.settings.summary_target,
             (
                 f"自动签到连续 {config.unverified_streak} 天未检测到明确成功回复："
@@ -2616,7 +2898,7 @@ class TelegramInsightService:
         else:
             link_text = ""
         encoded = _encode_alert_feedback(source.chat_id, decision.topic)
-        await self.bot.send_message(
+        await self._send_bot_message(
             self.settings.summary_target,
             (
                 f"重大事件提醒 [{_alert_priority_label(decision.priority)}]：{source.name}\n"
@@ -2676,7 +2958,7 @@ class TelegramInsightService:
             changed = True
             link = getattr(getattr(event, "message", None), "id", None)
             link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}" if link and source.username else ""
-            await self.bot.send_message(
+            await self._send_bot_message(
                 self.settings.summary_target,
                 f"话题订阅提醒：{source.name}\n关键词：{item['keyword']}\n{decision.new_information}\n原消息：{text[:1000]}{link_text}",
                 link_preview=False,
@@ -2930,7 +3212,7 @@ class TelegramInsightService:
         for chat_id, config in sorted(enabled.items(), key=lambda item: self._checkin_label(item[0])):
             detail = f"：{config.last_detail}" if config.last_detail else ""
             lines.append(f"- {self._checkin_label(chat_id)}：{config.last_status or '未执行'}{detail}")
-        await self.bot.send_message(self.settings.summary_target, "\n".join(lines), link_preview=False)
+        await self._send_bot_message(self.settings.summary_target, "\n".join(lines), link_preview=False)
         self.archive.set_state(CHECKIN_REPORT_STATE, day)
 
     async def _send_digest(self, target: int | str) -> None:
@@ -2965,7 +3247,7 @@ class TelegramInsightService:
                 advance_cursors,
             )
             if not messages:
-                await self.bot.send_message(target, "过去 24 小时没有可参与摘要的归档消息。")
+                await self._send_bot_message(target, "过去 24 小时没有可参与摘要的归档消息。")
                 if advance_cursors:
                     self._set_digest_cursors(source_ids, now)
                 return
@@ -2991,28 +3273,34 @@ class TelegramInsightService:
         self.archive.set_state(DIGEST_CURSORS_STATE, json.dumps(cursors, ensure_ascii=False))
 
     async def _set_bot_commands(self) -> None:
+        if hasattr(self, "archive") and self._language() is None:
+            commands = [
+                types.BotCommand(command="help", description="Choose language / 选择语言"),
+            ]
+        else:
+            commands = [
+                types.BotCommand(command="groups", description=self._text("选择要归档的群组")),
+                types.BotCommand(command="recent", description=self._text("读取指定群组的最近消息")),
+                types.BotCommand(command="ask", description=self._text("查询群聊历史")),
+                types.BotCommand(command="summary", description=self._text("生成过去 24 小时摘要")),
+                types.BotCommand(command="content", description=self._text("管理成人内容摘要排除")),
+                types.BotCommand(command="checkin", description=self._text("管理自动签到")),
+                types.BotCommand(command="alerts", description=self._text("配置重大事件提醒")),
+                types.BotCommand(command="topics", description=self._text("管理关键词话题订阅")),
+                types.BotCommand(command="refresh", description=self._text("刷新群组和机器人列表")),
+                types.BotCommand(command="backup", description=self._text("导出消息数据库备份")),
+                types.BotCommand(command="settings", description=self._text("设置每日推送")),
+                types.BotCommand(command="status", description=self._text("查看归档状态")),
+                types.BotCommand(command="retry", description=self._text("手动重试签到识别")),
+                types.BotCommand(command="help", description=self._text("查看帮助")),
+            ]
         await self.bot(
             functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopeDefault(),
                 # An empty language code is Telegram's universal command menu.
                 # Restricting this to "en" hides it for Chinese-language clients.
                 lang_code="",
-                commands=[
-                    types.BotCommand(command="groups", description="选择要归档的群组"),
-                    types.BotCommand(command="recent", description="读取指定群组的最近消息"),
-                    types.BotCommand(command="ask", description="查询群聊历史"),
-                    types.BotCommand(command="summary", description="生成过去 24 小时摘要"),
-                    types.BotCommand(command="content", description="管理成人内容摘要排除"),
-                    types.BotCommand(command="checkin", description="管理自动签到"),
-                    types.BotCommand(command="alerts", description="配置重大事件提醒"),
-                    types.BotCommand(command="topics", description="管理关键词话题订阅"),
-                    types.BotCommand(command="refresh", description="刷新群组和机器人列表"),
-                    types.BotCommand(command="backup", description="导出消息数据库备份"),
-                    types.BotCommand(command="settings", description="设置每日推送"),
-                    types.BotCommand(command="status", description="查看归档状态"),
-                    types.BotCommand(command="retry", description="手动重试签到识别"),
-                    types.BotCommand(command="help", description="查看帮助"),
-                ],
+                commands=commands,
             )
         )
 
@@ -3038,6 +3326,45 @@ def split_message(text: str, limit: int = 3800) -> list[str]:
         chunks.append(remaining[:boundary].strip())
         remaining = remaining[boundary:].strip()
     return [chunk for chunk in chunks if chunk]
+
+
+class _LocalizedEvent:
+    """Proxy Telegram events so every interactive response uses one language."""
+
+    def __init__(self, event: Any, language: str):
+        self._event = event
+        self._language = language
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._event, name)
+
+    async def reply(self, text: str = "", **kwargs: Any) -> Any:
+        if "buttons" in kwargs:
+            kwargs["buttons"] = _localize_buttons(kwargs["buttons"], self._language)
+        return await self._event.reply(_localize_text(text, self._language), **kwargs)
+
+    async def edit(self, text: str = "", **kwargs: Any) -> Any:
+        if "buttons" in kwargs:
+            kwargs["buttons"] = _localize_buttons(kwargs["buttons"], self._language)
+        return await self._event.edit(_localize_text(text, self._language), **kwargs)
+
+    async def answer(self, text: str = "", **kwargs: Any) -> Any:
+        return await self._event.answer(_localize_text(text, self._language), **kwargs)
+
+
+def _localize_buttons(buttons: Any, language: str | None) -> Any:
+    if not buttons or language != "en":
+        return buttons
+    return [
+        [
+            Button.inline(
+                _localize_text(getattr(button, "text", ""), language),
+                data=getattr(button, "data", b""),
+            )
+            for button in row
+        ]
+        for row in buttons
+    ]
 
 
 def _source_ids_from_state(value: str | None) -> tuple[int, ...]:
