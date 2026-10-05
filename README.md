@@ -7,6 +7,10 @@ choice is stored in the local SQLite state and controls Bot menus, notifications
 summaries, alerts, check-in reports, and AI answers. Use `/settings` to switch
 languages later; proactive notifications wait until a language has been selected.
 
+**Language / 语言:** [English](#english) · [中文](#中文说明)
+
+## English
+
 ## Behavior
 
 - A Telethon user session discovers its joined group chats; sources can be fixed in
@@ -226,3 +230,5 @@ the Docker build context.
 Telethon 会话文件拥有 Telegram 账号访问权限。请严格限制 `data/` 和 `.env` 的权限，并优先使用只加入必要群组的专用账号。
 聊天记录会发送给配置的 LLM 服务商用于摘要和问答，请选择符合群组隐私和留存要求的服务商。自定义 LLM 地址必须使用 HTTPS。
 运行镜像使用固定摘要的基础镜像并锁定依赖哈希；`.dockerignore` 会排除环境文件、会话文件和归档数据。
+
+[返回顶部](#tg-insight)
