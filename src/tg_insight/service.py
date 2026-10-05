@@ -1,20 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
+import hashlib
 import json
 import logging
 import random
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
+import aiohttp
 from telethon import Button, TelegramClient, events, functions, types
 
 from .config import Settings
-from .database import Archive, StoredMessage
+from .database import (
+    AIRetryJob,
+    Archive,
+    DeferredCheckinSuggestion,
+    MessageWriteResult,
+    StoredMessage,
+)
+from .health import clear_health, mark_healthy
 from .llm import (
     CONTENT_CATEGORIES,
     CheckinSuggestionDecision,
@@ -44,33 +56,84 @@ CHECKIN_OFFSET_MAX_MS = 800
 MAX_CHECKIN_TARGETS = 50
 MAX_CHECKIN_TEXT_LENGTH = 1_000
 CHECKIN_MAX_ATTEMPTS = 3
-CHECKIN_VERIFY_TIMEOUT_SECONDS = 8
+CHECKIN_FAILURE_ESCALATION_DAYS = 3
+CHECKIN_VERIFY_TIMEOUT_SECONDS = 20
+CHECKIN_PRIVATE_POLL_INTERVAL_SECONDS = 1.0
+CHECKIN_PRIVATE_POLL_MESSAGE_LIMIT = 12
 CHECKIN_HISTORY_LIMIT = 30
+CHECKIN_UNVERIFIED_ESCALATION_DAYS = 3
 CHECKIN_REPORT_STATE = "last_checkin_report_day"
 CHECKIN_REPORT_ENABLED_STATE = "checkin_report_enabled"
 CHECKIN_ALERT_STATE = "checkin_alerts"
+ALERT_FEEDBACK_STATE = "alert_feedback"
+ALERT_IGNORED_TOPICS_STATE = "alert_ignored_topics"
 CHECKIN_SUGGESTION_STATE = "checkin_suggestions"
 CHECKIN_SUGGESTION_IGNORES_STATE = "checkin_suggestion_ignores"
+TOPIC_SUBSCRIPTIONS_STATE = "topic_subscriptions"
+DIGEST_CURSORS_STATE = "digest_cursors"
 CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS = 12
+CHECKIN_SUGGESTION_STATUS_URL = "https://status.input.im/api/status"
+CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS = 8
+CHECKIN_SUGGESTION_STATUS_MAX_AGE_SECONDS = 15 * 60
+CHECKIN_SUGGESTION_RETRY_INITIAL_SECONDS = 30
+CHECKIN_SUGGESTION_RETRY_MAX_SECONDS = 15 * 60
+_CHECKIN_SUGGESTION_BACKOFF_ATTEMPTS = 6
+CHECKIN_SUGGESTION_MAX_AGE = dt.timedelta(hours=24)
+CHECKIN_SUGGESTION_DEFERRED_MAX_AGE = dt.timedelta(days=7)
+AI_RETRY_MAX_AGE = dt.timedelta(days=7)
+SYNC_RECONCILE_INTERVAL_SECONDS = 10 * 60
+SYNC_RECONCILE_MESSAGE_LIMIT = 200
+HEALTH_HEARTBEAT_INTERVAL_SECONDS = 15
 CHECKIN_SUCCESS_KEYWORDS = (
     "签到成功",
     "已签到",
     "签到完成",
+    "签到奖励",
+    "今日签到",
+    "连续签到",
     "获得积分",
+    "获得奖励",
     "签到成功啦",
     "恭喜签到",
     "打卡成功",
     "打卡完成",
+    "成功打卡",
+    "成功签到",
+    "签到已完成",
+    "签到通过",
+    "签到领取",
+    "领取签到奖励",
+    "签到积分",
+    "签到金币",
+    "签到经验",
+    "check-in complete",
+    "check in complete",
+    "check-in successful",
+    "check in successful",
+    "checked in",
 )
-CHECKIN_FAILURE_KEYWORDS = ("签到失败", "操作失败", "请稍后重试", "无权限", "已过期")
+CHECKIN_FAILURE_KEYWORDS = (
+    "签到失败", "签到未成功", "操作失败", "请稍后重试", "无权限", "已过期",
+    "check-in failed", "check in failed",
+)
 ALERT_EVENT_HINTS = (
-    "紧急", "重要通知", "故障", "中断", "截止", "封禁", "下架", "涨价", "降价",
-    "维护", "漏洞", "攻击", "泄露", "发布", "报名", "活动", "规则更新", "breaking",
+    "服务中断", "系统宕机", "安全漏洞", "数据泄露", "账户被盗", "资产风险", "封禁",
+    "关停", "下架", "紧急维护", "政策调整", "价格调整", "报名截止", "重大公告",
 )
-ALERT_KEYWORDS_DEFAULT = "紧急,重要通知,故障,截止,封禁,下架,涨价,维护,漏洞,攻击,泄露,发布,报名"
+ALERT_KEYWORDS_DEFAULT = (
+    "服务中断,系统宕机,安全漏洞,数据泄露,账户被盗,资产风险,封禁,关停,下架,"
+    "紧急维护,政策调整,价格调整,报名截止,重大公告"
+)
 ALERT_CONTEXT_MESSAGES = 12
 ALERT_MAX_MESSAGE_AGE = dt.timedelta(minutes=45)
-ALERT_TOPIC_COOLDOWN = dt.timedelta(minutes=15)
+ALERT_TOPIC_COOLDOWN = dt.timedelta(hours=1)
+ALERT_MIN_CANDIDATE_LENGTH = 16
+ALERT_NOISE_MARKERS = (
+    "有人知道", "请问", "求问", "怎么", "是否", "有没有", "听说", "据说", "传闻",
+    "例行", "周报", "日报", "活动预告", "教程", "闲聊", "讨论", "复盘", "回顾",
+)
+TOPIC_SUBSCRIPTION_COOLDOWN = dt.timedelta(minutes=30)
+MAX_TOPIC_SUBSCRIPTIONS = 20
 CHECKIN_COMMAND_PATTERN = re.compile(
     r"(?<![a-z0-9_])/(?:qd|checkin)(?:@[a-z0-9_]{5,})?(?![a-z0-9_])", re.IGNORECASE
 )
@@ -129,6 +192,8 @@ class CheckinConfig:
     topic_id: int | None = None
     last_status: str = ""
     last_detail: str = ""
+    failure_streak: int = 0
+    unverified_streak: int = 0
     history: tuple[CheckinRecord, ...] = ()
 
 
@@ -168,17 +233,32 @@ class TelegramInsightService:
         self._pending_checkin_schedule_users: dict[int, int] = {}
         self._pending_checkin_topic_users: dict[int, int] = {}
         self._pending_alert_keywords_users: set[int] = set()
+        self._pending_topic_users: dict[int, int] = {}
         self._checkin_waiters: dict[tuple[int, str], asyncio.Future[tuple[str, str]]] = {}
+        # Used when Telethon has not populated ``sender`` on a new message.
+        self._checkin_sent_message_ids: dict[tuple[int, str], int] = {}
         self._refresh_lock = asyncio.Lock()
         self._alert_tasks: set[asyncio.Task[None]] = set()
         self._alert_last_sent: dict[tuple[int, str], AlertRecord] = {}
+        self._alert_feedback: dict[tuple[int, str], str] = {}
         self._alert_lock = asyncio.Lock()
         self._checkin_suggestion_days: set[tuple[int, str]] = set()
         self._checkin_suggestion_candidates: dict[tuple[int, int], CheckinSuggestionCandidate] = {}
         self._checkin_suggestion_tasks: set[asyncio.Task[None]] = set()
+        self._checkin_ai_last_status: bool | None = None
+        self._ai_retry_last_status: bool | None = None
+        self._ai_retry_tasks: set[asyncio.Task[None]] = set()
         self._user_id: int | None = None
 
     async def run(self) -> None:
+        clear_health()
+        log.info(
+            "Service starting timezone=%s backfill_days=%d summary_time=%02d:%02d",
+            self.settings.timezone,
+            self.settings.backfill_days,
+            self.settings.summary_hour,
+            self.settings.summary_minute,
+        )
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
         self.archive.initialize()
         await self.user.connect()
@@ -186,26 +266,51 @@ class TelegramInsightService:
             raise RuntimeError("Telegram user session is not authorized; run auth first")
         me = await self.user.get_me()
         self._user_id = int(me.id)
+        log.info("Telegram user client authorized user_id=%s", self._user_id)
 
         await self.bot.start(bot_token=self.settings.bot_token)
+        log.info("Telegram bot client started")
         await self._discover_source_chats()
         await self._resolve_sources()
         self._register_handlers()
         await self._set_bot_commands()
+        # The clients are already connected, so enqueue missed updates only after
+        # handlers are installed. This avoids dropping restart-window updates.
+        await self.user.catch_up()
+        await self.bot.catch_up()
 
         await self._backfill()
         await self._classify_sources(tuple(self.sources.values()))
         self.archive.prune(self.settings.retention_days)
         scheduler = asyncio.create_task(self._scheduler(), name="daily-digest")
+        reconciler = asyncio.create_task(
+            self._sync_reconciler(), name="telegram-reconciliation"
+        )
+        heartbeat = asyncio.create_task(
+            self._heartbeat(), name="service-heartbeat"
+        )
+        user_runner = asyncio.create_task(
+            self.user.run_until_disconnected(), name="user-client"
+        )
+        bot_runner = asyncio.create_task(
+            self.bot.run_until_disconnected(), name="bot-client"
+        )
         log.info("Service ready with %d source chats", len(self.sources))
         try:
-            await asyncio.gather(
-                self.user.run_until_disconnected(),
-                self.bot.run_until_disconnected(),
-                scheduler,
+            done, _ = await asyncio.wait(
+                (user_runner, bot_runner, scheduler, reconciler, heartbeat),
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            completed = next(iter(done))
+            exception = completed.exception()
+            if exception is not None:
+                raise exception
+            raise RuntimeError(f"{completed.get_name()} stopped unexpectedly")
         finally:
-            scheduler.cancel()
+            log.warning("Service stopping; cancelling background tasks")
+            clear_health()
+            for task in (scheduler, reconciler, heartbeat, user_runner, bot_runner):
+                task.cancel()
             for task in self._backfill_tasks:
                 task.cancel()
             for task in self._classification_tasks:
@@ -218,6 +323,10 @@ class TelegramInsightService:
             await asyncio.gather(*self._classification_tasks, return_exceptions=True)
             await asyncio.gather(*self._alert_tasks, return_exceptions=True)
             await asyncio.gather(*self._checkin_suggestion_tasks, return_exceptions=True)
+            await asyncio.gather(
+                scheduler, reconciler, heartbeat, user_runner, bot_runner,
+                return_exceptions=True,
+            )
             await self.user.disconnect()
             await self.bot.disconnect()
 
@@ -354,12 +463,14 @@ class TelegramInsightService:
         self.user.add_event_handler(self._on_deleted_message, events.MessageDeleted)
         self.bot.add_event_handler(self._on_help, events.NewMessage(pattern=r"^/(start|help)$"))
         self.bot.add_event_handler(self._on_status, events.NewMessage(pattern=r"^/status$"))
+        self.bot.add_event_handler(self._on_retry, events.NewMessage(pattern=r"^/retry$"))
         self.bot.add_event_handler(self._on_summary, events.NewMessage(pattern=r"^/(summary|digest)$"))
         self.bot.add_event_handler(self._on_settings, events.NewMessage(pattern=r"^/settings$"))
         self.bot.add_event_handler(self._on_content, events.NewMessage(pattern=r"^/content$"))
         self.bot.add_event_handler(self._on_checkin, events.NewMessage(pattern=r"^/checkin$"))
         self.bot.add_event_handler(self._on_refresh, events.NewMessage(pattern=r"^/refresh$"))
         self.bot.add_event_handler(self._on_alerts, events.NewMessage(pattern=r"^/alerts$"))
+        self.bot.add_event_handler(self._on_topics, events.NewMessage(pattern=r"^/topics$"))
         self.bot.add_event_handler(self._on_backup, events.NewMessage(pattern=r"^/backup$"))
         self.bot.add_event_handler(self._on_ask, events.NewMessage(pattern=r"^/ask(?:\s+(.+))?$"))
         self.bot.add_event_handler(self._on_groups, events.NewMessage(pattern=r"^/groups$"))
@@ -367,7 +478,7 @@ class TelegramInsightService:
         self.bot.add_event_handler(
             self._on_group_callback,
             events.CallbackQuery(
-                pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx)(?::|$)|(?:s|st|sd)$)"
+            pattern=rb"^(?:(?:g|gp|ga|gx|gd|r|rp|c|cp|cr|cra|k|kp|kc|km|kt|ke|kr|kd|kh|ko|kf|ka|kb|ks|ki|k7|kx|ku|kv|kw|tp|td|ti|af|ro)(?::|$)|(?:s|st|sd)$)"
             ),
         )
         self.bot.add_event_handler(self._on_private_text, events.NewMessage(incoming=True))
@@ -389,10 +500,12 @@ class TelegramInsightService:
         if event.chat_id in self.sources:
             self.archive.delete(event.chat_id, event.deleted_ids)
 
-    async def _store_telegram_message(self, source: SourceChat, message: Any) -> bool:
+    async def _store_telegram_message(
+        self, source: SourceChat, message: Any
+    ) -> MessageWriteResult:
         text = message.raw_text or ""
         if not text:
-            return False
+            return MessageWriteResult.SKIPPED
         sender = message.sender
         if sender is None:
             try:
@@ -422,16 +535,60 @@ class TelegramInsightService:
         cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
             days=self.settings.backfill_days
         )
+        log.info("Backfill started sources=%d cutoff=%s", len(sources), cutoff.isoformat())
         for source in sources:
-            count = 0
+            scanned = inserted = updated = 0
             async for message in self.user.iter_messages(
                 source.entity, limit=self.settings.backfill_max_messages
             ):
                 if message.date < cutoff:
                     break
-                if await self._store_telegram_message(source, message):
-                    count += 1
-            log.info("Backfilled %d messages from %s", count, source.name)
+                scanned += 1
+                result = await self._store_telegram_message(source, message)
+                inserted += result is MessageWriteResult.INSERTED
+                updated += result is MessageWriteResult.UPDATED
+            log.info(
+                "Backfill completed chat_id=%s scanned=%d inserted=%d updated=%d unchanged=%d",
+                source.chat_id,
+                scanned,
+                inserted,
+                updated,
+                scanned - inserted - updated,
+            )
+        log.info("Backfill completed sources=%d", len(sources))
+
+    async def _sync_reconciler(self) -> None:
+        while True:
+            await asyncio.sleep(SYNC_RECONCILE_INTERVAL_SECONDS)
+            scanned = inserted = updated = 0
+            for source in tuple(self.sources.values()):
+                try:
+                    async for message in self.user.iter_messages(
+                        source.entity, limit=SYNC_RECONCILE_MESSAGE_LIMIT
+                    ):
+                        scanned += 1
+                        result = await self._store_telegram_message(source, message)
+                        inserted += result is MessageWriteResult.INSERTED
+                        updated += result is MessageWriteResult.UPDATED
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Recent-message reconciliation failed for chat id=%s", source.chat_id)
+            log.info(
+                "Reconciled recent messages scanned=%d inserted=%d updated=%d unchanged=%d",
+                scanned,
+                inserted,
+                updated,
+                scanned - inserted - updated,
+            )
+
+    async def _heartbeat(self) -> None:
+        while True:
+            if not self.user.is_connected() or not self.bot.is_connected():
+                clear_health()
+                raise RuntimeError("Telegram client disconnected")
+            mark_healthy()
+            await asyncio.sleep(HEALTH_HEARTBEAT_INTERVAL_SECONDS)
 
     async def _on_help(self, event: Any) -> None:
         if not await self._private_authorized(event):
@@ -445,10 +602,12 @@ class TelegramInsightService:
             "/content - 识别内容类型并排除成人群摘要\n"
             "/checkin - 管理自动签到\n"
             "/alerts - 配置重大事件提醒\n"
+            "/topics - 管理关键词话题订阅\n"
             "/refresh - 重新扫描群组和机器人\n"
             "/backup - 导出不含凭据的消息数据库\n"
             "/settings - 设置每日推送时间和开关\n"
             "/status - 查看归档和定时任务状态\n\n"
+            "/retry - 手动重试等待中的签到识别\n\n"
             "也可以直接私聊发送问题。群组选择和最近消息仅在私聊中可用。"
         )
 
@@ -461,6 +620,7 @@ class TelegramInsightService:
             _summary_excluded(source.chat_id, overrides, classifications)
             for source in self.sources.values()
         )
+
         hour, minute = self._digest_schedule()
         checkins = self._checkin_configs()
         enabled_checkins = sum(config.enabled for config in checkins.values())
@@ -479,6 +639,7 @@ class TelegramInsightService:
             f"每日摘要：{schedule}（{self.settings.timezone}）\n"
             f"自动签到：{enabled_checkins}/{len(checkins)} 个群已开启\n"
             f"重大事件提醒：{'开启' if alert_enabled else '关闭'}\n"
+            f"话题订阅：{len(self._topic_subscriptions())} 个\n"
             f"AI 模型：{self.settings.llm_model}"
             + (
                 f"（备用：{self.settings.llm_fallback_model}）"
@@ -487,6 +648,24 @@ class TelegramInsightService:
             )
         )
         await _send_long(event, text)
+
+    async def _on_retry(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        checkin_status, checkin_count = await self._retry_deferred_checkin_suggestions(
+            dt.datetime.now(ZoneInfo(self.settings.timezone)), force=True
+        )
+        ai_status, ai_count = await self._retry_ai_jobs(
+            dt.datetime.now(ZoneInfo(self.settings.timezone)), force=True
+        )
+        status = ai_status if ai_status is not None else checkin_status
+        count = checkin_count + ai_count
+        if status is True:
+            await event.reply(f"已手动触发 {count} 个待处理 AI 任务的重试。")
+        elif status is False:
+            await event.reply("当前配置的 AI 模型仍不可用，暂不重试；候选已保留。")
+        else:
+            await event.reply("暂时无法确认 AI 状态，未触发重试；候选已保留。")
 
     async def _on_summary(self, event: Any) -> None:
         if not await self._private_authorized(event):
@@ -530,6 +709,12 @@ class TelegramInsightService:
         text, buttons = self._alerts_picker()
         await event.reply(text, buttons=buttons)
 
+    async def _on_topics(self, event: Any) -> None:
+        if not await self._private_authorized(event):
+            return
+        text, buttons = self._topics_picker()
+        await event.reply(text, buttons=buttons)
+
     async def _on_backup(self, event: Any) -> None:
         if not await self._private_authorized(event):
             return
@@ -567,12 +752,67 @@ class TelegramInsightService:
             "重大事件提醒\n"
             f"状态：{'开启' if enabled else '关闭'}\n"
             f"关键词：{', '.join(keywords)}\n"
-            "命中关键词会立即提醒；同时对少量事件线索使用 AI 复核，避免普通聊天打扰。"
+            "仅明确风险、影响或硬截止会进入 AI 复核；疑问、传闻、例行通知和讨论不会推送。"
         )
         return text, [
             [Button.inline("关闭提醒" if enabled else "开启提醒", data=b"ka")],
             [Button.inline("修改关键词", data=b"kb")],
         ]
+
+    def _topic_subscriptions(self) -> list[dict[str, Any]]:
+        archive = getattr(self, "archive", None)
+        if archive is None or not hasattr(archive, "get_state"):
+            return []
+        try:
+            raw = json.loads(archive.get_state(TOPIC_SUBSCRIPTIONS_STATE) or "[]")
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(raw, list):
+            return []
+        result: list[dict[str, Any]] = []
+        for item in raw[:MAX_TOPIC_SUBSCRIPTIONS]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                chat_id = int(item["chat_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            keyword = " ".join(str(item.get("keyword", "")).split())[:80]
+            if keyword:
+                result.append({"chat_id": chat_id, "keyword": keyword, "last_sent": str(item.get("last_sent", ""))})
+        return result
+
+    def _save_topic_subscriptions(self, values: Sequence[dict[str, Any]]) -> None:
+        self.archive.set_state(TOPIC_SUBSCRIPTIONS_STATE, json.dumps(list(values)[:MAX_TOPIC_SUBSCRIPTIONS], ensure_ascii=False))
+
+    def _topics_picker(self) -> tuple[str, list[list[Any]]]:
+        subscriptions = self._topic_subscriptions()
+        lines = ["话题订阅", "命中关键词后由 AI 判断是否为新进展，并私聊提醒。"]
+        buttons: list[list[Any]] = [[Button.inline("添加订阅", data=b"tp:0")]]
+        for index, item in enumerate(subscriptions):
+            source = self.available_sources.get(int(item["chat_id"]))
+            name = source.name if source else str(item["chat_id"])
+            lines.append(f"- {name}：{item['keyword']}")
+            buttons.append([Button.inline("移除：" + _short_name(f"{name} {item['keyword']}", 28), data=f"td:{index}".encode())])
+        if len(subscriptions) >= MAX_TOPIC_SUBSCRIPTIONS:
+            lines.append(f"已达到 {MAX_TOPIC_SUBSCRIPTIONS} 个订阅上限。")
+        return "\n".join(lines), buttons
+
+    def _topic_target_picker(self, page: int) -> tuple[str, list[list[Any]]]:
+        groups = sorted(self.available_sources.values(), key=lambda source: source.name.casefold())
+        pages = max(1, (len(groups) + GROUPS_PAGE_SIZE - 1) // GROUPS_PAGE_SIZE)
+        page = max(0, min(page, pages - 1))
+        current = groups[page * GROUPS_PAGE_SIZE : (page + 1) * GROUPS_PAGE_SIZE]
+        buttons = [[Button.inline(_short_name(source.name, 34), data=f"ti:{page}:{source.chat_id}".encode())] for source in current]
+        navigation: list[Any] = []
+        if page > 0:
+            navigation.append(Button.inline("上一页", data=f"tp:{page - 1}".encode()))
+        if page + 1 < pages:
+            navigation.append(Button.inline("下一页", data=f"tp:{page + 1}".encode()))
+        if navigation:
+            buttons.append(navigation)
+        buttons.append([Button.inline("返回订阅", data=b"tp:back")])
+        return f"选择要订阅的群组（第 {page + 1}/{pages} 页）：", buttons
 
     def _checkin_picker(self) -> tuple[str, list[list[Any]]]:
         configs = self._checkin_configs()
@@ -589,6 +829,8 @@ class TelegramInsightService:
                 lines.append(
                     f"- {self._checkin_label(chat_id)}：{state}，"
                     f"{config.hour:02d}:{config.minute:02d}+随机偏移，上次 {last}"
+                    + (f"，连续失败 {config.failure_streak} 天" if config.failure_streak else "")
+                    + (f"，连续未验证 {config.unverified_streak} 天" if config.unverified_streak else "")
                 )
             text = "\n".join(lines)
         buttons: list[list[Any]] = [
@@ -662,7 +904,8 @@ class TelegramInsightService:
             f"文本：{config.text}\n"
             f"上次状态：{config.last_status or '尚未执行'}，{last}\n"
             f"详情：{config.last_detail or '无'}\n"
-            "立即签到会计入今天，避免定时任务重复发送。"
+            + (f"连续未验证：{config.unverified_streak} 天\n" if config.unverified_streak else "")
+            + "立即签到会计入今天，避免定时任务重复发送。"
         )
         return text, [
             [Button.inline("更改签到文本", data=f"km:{chat_id}".encode())],
@@ -883,6 +1126,44 @@ class TelegramInsightService:
                 await event.answer()
                 await event.edit("请发送逗号分隔的关键词，例如：紧急,故障,截止,涨价")
                 return
+            if action == "tp" and len(parts) == 2:
+                if parts[1] == "back":
+                    text, buttons = self._topics_picker()
+                    await event.edit(text, buttons=buttons)
+                    return
+                if len(self._topic_subscriptions()) >= MAX_TOPIC_SUBSCRIPTIONS:
+                    await event.answer("已达到订阅上限。", alert=True)
+                    return
+                text, buttons = self._topic_target_picker(int(parts[1]))
+                await event.answer()
+                await event.edit(text, buttons=buttons)
+                return
+            if action == "ti" and len(parts) == 3:
+                chat_id = int(parts[2])
+                if chat_id not in self.available_sources:
+                    raise ValueError("unknown topic target")
+                self._pending_topic_users[event.sender_id] = chat_id
+                await event.answer()
+                await event.edit("请发送要关注的关键词，例如：固件发布、漏洞、价格变化")
+                return
+            if action == "td" and len(parts) == 2:
+                index = int(parts[1])
+                subscriptions = self._topic_subscriptions()
+                if not 0 <= index < len(subscriptions):
+                    raise ValueError("unknown topic subscription")
+                subscriptions.pop(index)
+                self._save_topic_subscriptions(subscriptions)
+                await event.answer("订阅已移除。")
+                text, buttons = self._topics_picker()
+                await event.edit(text, buttons=buttons)
+                return
+            if action == "af" and len(parts) == 3:
+                feedback, encoded = parts[1], parts[2]
+                chat_id, topic = _decode_alert_feedback(encoded)
+                self._save_alert_feedback(chat_id, topic, feedback)
+                await event.answer("反馈已保存。")
+                await event.edit("已记录你的反馈，后续会减少相同主题的重复提醒。")
+                return
             if action in {"ks", "ki", "k7", "kx"} and len(parts) == 2:
                 chat_id = int(parts[1])
                 source = self.available_sources.get(chat_id)
@@ -1009,6 +1290,35 @@ class TelegramInsightService:
                 self._save_checkin_configs(configs)
                 await event.answer("签到目标已移除。")
                 text, buttons = self._checkin_picker()
+                await event.edit(text, buttons=buttons)
+                return
+            if action in {"ku", "kv", "kw"} and len(parts) == 2:
+                chat_id = int(parts[1])
+                configs = self._checkin_configs()
+                config = configs.get(chat_id)
+                if config is None:
+                    raise ValueError("unknown check-in target")
+                if action == "kw":
+                    del configs[chat_id]
+                    message = "签到目标已移除。"
+                else:
+                    configs[chat_id] = _replace_checkin(
+                        config,
+                        enabled=config.enabled if action == "ku" else False,
+                        unverified_streak=0,
+                    )
+                    message = (
+                        "继续保留自动签到，已清除未验证计数。"
+                        if action == "ku"
+                        else "已关闭该目标的自动签到。"
+                    )
+                self._save_checkin_configs(configs)
+                await event.answer(message)
+                text, buttons = (
+                    self._checkin_picker()
+                    if action == "kw"
+                    else self._checkin_config_picker(chat_id)
+                )
                 await event.edit(text, buttons=buttons)
                 return
             if action == "gp" and len(parts) == 2:
@@ -1143,6 +1453,19 @@ class TelegramInsightService:
             self._pending_alert_keywords_users.discard(event.sender_id)
             await event.reply("重大事件提醒关键词已保存。")
             return
+        chat_id = self._pending_topic_users.get(event.sender_id)
+        if chat_id is not None:
+            keyword = " ".join(event.raw_text.split())[:80]
+            if not keyword:
+                await event.reply("关键词不能为空。")
+                return
+            subscriptions = self._topic_subscriptions()
+            subscriptions = [item for item in subscriptions if not (item["chat_id"] == chat_id and item["keyword"].casefold() == keyword.casefold())]
+            subscriptions.append({"chat_id": chat_id, "keyword": keyword, "last_sent": ""})
+            self._save_topic_subscriptions(subscriptions)
+            self._pending_topic_users.pop(event.sender_id, None)
+            await event.reply("话题订阅已保存。发送 /topics 可管理。")
+            return
         chat_id = self._pending_checkin_topic_users.get(event.sender_id)
         if chat_id is not None:
             raw_topic = event.raw_text.strip()
@@ -1228,25 +1551,32 @@ class TelegramInsightService:
     async def _answer_question(self, event: Any, question: str) -> None:
         progress = await event.reply("正在检索历史消息...")
         try:
-            terms = await self.llm.query_terms(question)
-            messages = self.archive.search(
-                tuple(self.sources), terms, self.settings.query_max_sources
-            )
-            if len(messages) < min(8, self.settings.query_max_sources):
-                existing = {(m.chat_id, m.message_id) for m in messages}
-                for item in self.archive.recent(
-                    tuple(self.sources), self.settings.query_max_sources
-                ):
-                    if (item.chat_id, item.message_id) not in existing:
-                        messages.append(item)
-                    if len(messages) >= self.settings.query_max_sources:
-                        break
-            answer = await self.llm.answer(question, messages)
+            answer = await self._answer_question_value(question)
             await progress.delete()
             await _send_long(event, render_answer(answer))
-        except Exception:
+        except Exception as exc:
             log.exception("Question answering failed")
-            await progress.edit("查询失败，请检查服务日志。")
+            job_key = f"ask:{event.chat_id}:{hashlib.sha256(question.encode()).hexdigest()[:24]}"
+            self._enqueue_ai_retry_job(
+                "ask",
+                {"target": event.chat_id, "question": question[:2000]},
+                exc,
+                retry_count=0,
+                job_key=job_key,
+            )
+            await progress.edit("查询失败，已加入 AI 重试队列；模型恢复后会自动重试。")
+
+    async def _answer_question_value(self, question: str):
+        terms = await self.llm.query_terms(question)
+        messages = self.archive.search(tuple(self.sources), terms, self.settings.query_max_sources)
+        if len(messages) < min(8, self.settings.query_max_sources):
+            existing = {(m.chat_id, m.message_id) for m in messages}
+            for item in self.archive.recent(tuple(self.sources), self.settings.query_max_sources):
+                if (item.chat_id, item.message_id) not in existing:
+                    messages.append(item)
+                if len(messages) >= self.settings.query_max_sources:
+                    break
+        return await self.llm.answer(question, _redact_messages(messages))
 
     async def _authorized(self, event: Any, reply_denied: bool = True) -> bool:
         if event.sender_id in self.settings.allowed_user_ids:
@@ -1317,6 +1647,48 @@ class TelegramInsightService:
         keywords = _parse_alert_keywords(raw.get("keywords", ALERT_KEYWORDS_DEFAULT))
         return enabled, keywords or _parse_alert_keywords(ALERT_KEYWORDS_DEFAULT)
 
+    def _alert_topic_ignored(self, chat_id: int, topic: str) -> bool:
+        try:
+            raw = json.loads(self.archive.get_state(ALERT_IGNORED_TOPICS_STATE) or "{}")
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        topics = raw.get(str(chat_id), [])
+        if not isinstance(topics, list):
+            return False
+        fingerprint = _alert_topic_fingerprint(topic)
+        return fingerprint in {str(item)[:100] for item in topics}
+
+    def _save_alert_feedback(self, chat_id: int, topic: str, feedback: str) -> None:
+        fingerprint = _alert_topic_fingerprint(topic)
+        if not fingerprint or feedback not in {"important", "ignore"}:
+            raise ValueError("invalid alert feedback")
+        try:
+            feedbacks = json.loads(self.archive.get_state(ALERT_FEEDBACK_STATE) or "{}")
+        except json.JSONDecodeError:
+            feedbacks = {}
+        if not isinstance(feedbacks, dict):
+            feedbacks = {}
+        feedbacks.setdefault(str(chat_id), {})[fingerprint] = feedback
+        self.archive.set_state(ALERT_FEEDBACK_STATE, json.dumps(feedbacks, ensure_ascii=False))
+        if feedback != "ignore":
+            return
+        try:
+            ignored = json.loads(self.archive.get_state(ALERT_IGNORED_TOPICS_STATE) or "{}")
+        except json.JSONDecodeError:
+            ignored = {}
+        if not isinstance(ignored, dict):
+            ignored = {}
+        topics = ignored.setdefault(str(chat_id), [])
+        if not isinstance(topics, list):
+            topics = []
+            ignored[str(chat_id)] = topics
+        if fingerprint not in topics:
+            topics.append(fingerprint)
+        ignored[str(chat_id)] = topics[-50:]
+        self.archive.set_state(ALERT_IGNORED_TOPICS_STATE, json.dumps(ignored, ensure_ascii=False))
+
     async def _refresh_dialogs(self) -> int:
         async with self._refresh_lock:
             await self._discover_source_chats()
@@ -1347,6 +1719,8 @@ class TelegramInsightService:
 
     async def _send_checkin(self, chat_id: int, mark_today: bool) -> None:
         async with self._checkin_lock:
+            if not hasattr(self, "_checkin_sent_message_ids"):
+                self._checkin_sent_message_ids = {}
             configs = self._checkin_configs()
             config = configs.get(chat_id)
             target = self.available_checkin_targets.get(chat_id)
@@ -1354,18 +1728,58 @@ class TelegramInsightService:
                 raise ValueError("check-in target is unavailable")
             sent_at = dt.datetime.now(ZoneInfo(self.settings.timezone))
             day = sent_at.date().isoformat()
+            log.info(
+                "Check-in dispatch started chat_id=%s target_kind=%s scheduled=%s",
+                chat_id,
+                target.target_kind,
+                mark_today,
+            )
             waiter: asyncio.Future[tuple[str, str]] = asyncio.get_running_loop().create_future()
             self._checkin_waiters[(chat_id, day)] = waiter
+            private_target = await self._checkin_private_bot_target(target, config.text)
+            private_cursor: int | None = None
+            if private_target is not None:
+                private_cursor = await self._latest_checkin_private_message_id(
+                    private_target[0], chat_id
+                )
+            private_poll_task: asyncio.Task[None] | None = None
             try:
                 send_kwargs: dict[str, Any] = {"link_preview": False}
                 if target.target_kind == "group" and config.topic_id:
                     send_kwargs["reply_to"] = config.topic_id
                 sent_message = await self.user.send_message(target.entity, config.text, **send_kwargs)
+                sent_id = getattr(sent_message, "id", None)
+                if isinstance(sent_id, int):
+                    self._checkin_sent_message_ids[(chat_id, day)] = sent_id
+                if private_target is not None and private_cursor is not None:
+                    private_poll_task = asyncio.create_task(
+                        self._poll_checkin_private_reply(
+                            chat_id=chat_id,
+                            private_entity=private_target[0],
+                            private_chat_id=private_target[1],
+                            after_message_id=private_cursor,
+                            waiter=waiter,
+                        ),
+                        name=f"checkin-private-verification-{chat_id}",
+                    )
+                    log.info(
+                        "Check-in private verifier armed chat_id=%s private_chat_id=%s "
+                        "after_message_id=%s",
+                        chat_id,
+                        private_target[1],
+                        private_cursor,
+                    )
             except Exception as exc:
                 self._checkin_waiters.pop((chat_id, day), None)
+                self._checkin_sent_message_ids.pop((chat_id, day), None)
                 detail = _safe_error(exc)
                 configs[chat_id] = _append_checkin_record(config, "send_failed", detail, sent_at)
                 self._save_checkin_configs(configs)
+                log.warning(
+                    "Check-in dispatch failed chat_id=%s error_type=%s",
+                    chat_id,
+                    type(exc).__name__,
+                )
                 raise
 
             try:
@@ -1373,9 +1787,16 @@ class TelegramInsightService:
                     waiter, timeout=CHECKIN_VERIFY_TIMEOUT_SECONDS
                 )
             except asyncio.TimeoutError:
-                status, detail = "sent_unverified", "已发送，等待窗口内未发现明确成功回复"
+                detail = "已发送，等待窗口内未发现明确成功回复"
+                if private_target is not None and private_cursor is not None:
+                    detail = "已发送；群内及目标 Bot 私聊均未发现明确成功回复"
+                status = "sent_unverified"
             finally:
+                if private_poll_task is not None:
+                    private_poll_task.cancel()
+                    await asyncio.gather(private_poll_task, return_exceptions=True)
                 self._checkin_waiters.pop((chat_id, day), None)
+                self._checkin_sent_message_ids.pop((chat_id, day), None)
 
             latest = self._checkin_configs().get(chat_id, config)
             latest = _append_checkin_record(latest, status, detail, sent_at)
@@ -1389,10 +1810,129 @@ class TelegramInsightService:
                     scheduled_for="",
                 )
             self._save_checkin_configs({**self._checkin_configs(), chat_id: latest})
+            log.info(
+                "Check-in verification finished chat_id=%s status=%s detail_chars=%d",
+                chat_id,
+                status,
+                len(detail),
+            )
             if status == "failed":
                 raise CheckinVerificationError(detail)
             if status == "send_failed":
                 raise CheckinVerificationError(detail)
+
+    async def _checkin_private_bot_target(
+        self, target: SourceChat, checkin_text: str
+    ) -> tuple[Any, int] | None:
+        """Resolve the Bot private chat that may carry this check-in result."""
+        if target.target_kind == "bot":
+            return target.entity, target.chat_id
+        username = _checkin_bot_username(checkin_text)
+        if username is None:
+            return None
+        try:
+            entity = await self.user.get_entity(username)
+            if not getattr(entity, "bot", False):
+                log.warning(
+                    "Check-in private verifier rejected non-bot target chat_id=%s",
+                    target.chat_id,
+                )
+                return None
+            private_chat_id = int(await self.user.get_peer_id(entity))
+        except Exception as exc:
+            log.warning(
+                "Check-in private verifier could not resolve target chat_id=%s error_type=%s",
+                target.chat_id,
+                type(exc).__name__,
+            )
+            return None
+        return entity, private_chat_id
+
+    async def _latest_checkin_private_message_id(
+        self, private_entity: Any, chat_id: int
+    ) -> int | None:
+        """Capture a fail-closed cursor so an old private reply cannot verify today."""
+        try:
+            async for message in self.user.iter_messages(private_entity, limit=1):
+                message_id = getattr(message, "id", None)
+                return message_id if isinstance(message_id, int) else 0
+        except Exception as exc:
+            log.warning(
+                "Check-in private verifier cursor failed chat_id=%s error_type=%s",
+                chat_id,
+                type(exc).__name__,
+            )
+            return None
+        return 0
+
+    async def _poll_checkin_private_reply(
+        self,
+        *,
+        chat_id: int,
+        private_entity: Any,
+        private_chat_id: int,
+        after_message_id: int,
+        waiter: asyncio.Future[tuple[str, str]],
+    ) -> None:
+        """Use only new inbound Bot PMs as a second verification channel."""
+        started = time.monotonic()
+        logged_error = False
+        seen_message_ids: set[int] = set()
+        while not waiter.done():
+            try:
+                async for message in self.user.iter_messages(
+                    private_entity, limit=CHECKIN_PRIVATE_POLL_MESSAGE_LIMIT
+                ):
+                    message_id = getattr(message, "id", None)
+                    if not isinstance(message_id, int) or message_id <= after_message_id:
+                        continue
+                    if message_id in seen_message_ids:
+                        continue
+                    seen_message_ids.add(message_id)
+                    if getattr(message, "out", False):
+                        continue
+                    text = (
+                        getattr(message, "raw_text", "")
+                        or getattr(message, "message", "")
+                        or ""
+                    ).strip()
+                    status = _checkin_verification_status(
+                        text,
+                        from_bot=True,
+                        target_kind="bot",
+                    )
+                    if status is None:
+                        log.info(
+                            "Check-in private bot reply observed without decision "
+                            "chat_id=%s private_chat_id=%s message_id=%s",
+                            chat_id,
+                            private_chat_id,
+                            message_id,
+                        )
+                        continue
+                    if not waiter.done():
+                        waiter.set_result((status, text[:300]))
+                        log.info(
+                            "Check-in private bot reply verified chat_id=%s private_chat_id=%s "
+                            "status=%s message_id=%s elapsed_ms=%d",
+                            chat_id,
+                            private_chat_id,
+                            status,
+                            message_id,
+                            int((time.monotonic() - started) * 1000),
+                        )
+                    return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if not logged_error:
+                    log.warning(
+                        "Check-in private verifier poll failed chat_id=%s error_type=%s",
+                        chat_id,
+                        type(exc).__name__,
+                    )
+                    logged_error = True
+            await asyncio.sleep(CHECKIN_PRIVATE_POLL_INTERVAL_SECONDS)
 
     async def _observe_checkin_message(self, event: Any) -> None:
         # The user's own outbound command is not a verification response. This
@@ -1417,11 +1957,18 @@ class TelegramInsightService:
         sender = getattr(getattr(event, "message", None), "sender", None)
         if sender is None:
             sender = getattr(event, "sender", None)
+        sender_unresolved = sender is None
         from_bot = bool(getattr(sender, "bot", False))
+        reply_to_id = getattr(getattr(event, "message", None), "reply_to_msg_id", None)
+        sent_id = getattr(self, "_checkin_sent_message_ids", {}).get(key)
+        # Only use reply linkage as a fallback when sender resolution failed.
+        # A known human replying to our message must stay untrusted.
+        direct_reply = sender_unresolved and isinstance(sent_id, int) and reply_to_id == sent_id
         status = _checkin_verification_status(
             text,
             from_bot=from_bot,
             target_kind=target.target_kind if target is not None else None,
+            direct_reply=direct_reply,
         )
         if status is not None:
             waiter.set_result((status, text[:300]))
@@ -1483,64 +2030,398 @@ class TelegramInsightService:
         if candidate is not None and not candidate.bot_reply:
             candidate.bot_reply = text[:MAX_CHECKIN_TEXT_LENGTH]
 
-    async def _analyze_checkin_suggestion(self, candidate_key: tuple[int, int]) -> None:
+    async def _analyze_checkin_suggestion(
+        self, candidate_key: tuple[int, int], *, wait_for_bot_reply: bool = True, deferred: bool = False
+    ) -> None:
         try:
-            await asyncio.sleep(CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS)
-            candidate = self._checkin_suggestion_candidates.pop(candidate_key, None)
-            if candidate is None or not candidate.bot_reply:
-                return
-            day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
-            key = (candidate.chat_id, day)
-            if (
-                key in self._checkin_suggestion_days
-                or candidate.chat_id in self._checkin_configs()
-                or self._checkin_suggestion_ignored(candidate.chat_id, dt.date.fromisoformat(day))
-            ):
-                return
-            decision = await self.llm.assess_checkin_suggestion(
-                candidate.source_name,
-                candidate.source_sender,
-                candidate.source_time,
-                candidate.source_text,
-                candidate.bot_reply,
-            )
-            if not decision.should_suggest or not _is_literal_checkin_proposal(
-                decision.proposed_text, candidate.source_text
-            ):
-                return
-            self._checkin_suggestion_days.add(key)
-            self._save_checkin_suggestion(candidate, decision, day)
-            source_link = _telegram_message_link(
-                candidate.chat_id, candidate.source_username, candidate.message_id
-            )
-            stamp = candidate.source_time.astimezone(ZoneInfo(self.settings.timezone)).strftime(
-                "%Y-%m-%d %H:%M %Z"
-            )
-            await self.bot.send_message(
-                self.settings.summary_target,
-                (
-                    "检测到可复用的签到操作，请确认是否部署。\n"
-                    f"群组：{candidate.source_name}\n"
-                    f"源消息（{stamp}，{candidate.source_sender}）：{candidate.source_text[:300]}\n"
-                    f"Bot 回复：{candidate.bot_reply[:500]}\n"
-                    f"AI 判断（高置信）：{decision.reason}\n"
-                    f"建议自动发送：{decision.proposed_text}"
-                    + (f"\n来源链接：{source_link}" if source_link else "")
-                ),
-                buttons=[
-                    [
-                        Button.inline("同意并部署", data=f"ks:{candidate.chat_id}".encode()),
-                        Button.inline("今天忽略", data=f"ki:{candidate.chat_id}".encode()),
+            if wait_for_bot_reply:
+                await asyncio.sleep(CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS)
+            attempt = 0
+            while True:
+                candidate = self._checkin_suggestion_candidates.get(candidate_key)
+                if candidate is None or not candidate.bot_reply:
+                    self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    if deferred:
+                        self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                    return
+                max_age = CHECKIN_SUGGESTION_DEFERRED_MAX_AGE if deferred else CHECKIN_SUGGESTION_MAX_AGE
+                if _checkin_suggestion_expired(candidate.source_time, max_age=max_age):
+                    self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    if deferred:
+                        self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                    log.info("Dropping expired check-in suggestion candidate=%s", candidate_key)
+                    return
+                day = dt.datetime.now(ZoneInfo(self.settings.timezone)).date().isoformat()
+                key = (candidate.chat_id, day)
+                if (
+                    key in self._checkin_suggestion_days
+                    or candidate.chat_id in self._checkin_configs()
+                    or self._checkin_suggestion_ignored(candidate.chat_id, dt.date.fromisoformat(day))
+                ):
+                    self._checkin_suggestion_candidates.pop(candidate_key, None)
+                    if deferred:
+                        self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                    return
+
+                # The public status probe is only a back-pressure signal. An unknown or
+                # stale probe must never discard evidence; the real API remains authoritative.
+                if await self._checkin_ai_unavailable():
+                    delay = _checkin_suggestion_retry_delay(attempt)
+                    attempt += 1
+                    log.warning(
+                        "Configured AI models are unavailable according to status.input.im; "
+                        "retrying check-in candidate=%s in %ss",
+                        candidate_key,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                try:
+                    decision = await self.llm.assess_checkin_suggestion(
+                        candidate.source_name,
+                        candidate.source_sender,
+                        candidate.source_time,
+                        _redact_for_llm(candidate.source_text),
+                        _redact_for_llm(candidate.bot_reply),
+                    )
+                except Exception as exc:
+                    if not _is_retryable_checkin_ai_error(exc) and not _is_deferred_checkin_ai_error(exc):
+                        self._checkin_suggestion_candidates.pop(candidate_key, None)
+                        if deferred:
+                            self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                        log.exception("Check-in suggestion analysis failed permanently for candidate=%s", candidate_key)
+                        return
+                    delay = _checkin_suggestion_retry_delay(attempt)
+                    attempt += 1
+                    if _is_deferred_checkin_ai_error(exc) and attempt > _CHECKIN_SUGGESTION_BACKOFF_ATTEMPTS:
+                        self._checkin_suggestion_candidates.pop(candidate_key, None)
+                        self._defer_checkin_suggestion(candidate, exc, retry_count=attempt)
+                        log.warning(
+                            "Persisting check-in suggestion candidate=%s until status.input.im reports a model available: %s",
+                            candidate_key,
+                            _safe_error(exc),
+                        )
+                        return
+                    log.warning(
+                        "Temporary AI failure for check-in candidate=%s; retrying in %ss: %s",
+                        candidate_key,
+                        delay,
+                        _safe_error(exc),
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                self._checkin_suggestion_candidates.pop(candidate_key, None)
+                if deferred:
+                    self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                if not decision.should_suggest or not _is_literal_checkin_proposal(
+                    decision.proposed_text, candidate.source_text
+                ):
+                    return
+                self._checkin_suggestion_days.add(key)
+                self._save_checkin_suggestion(candidate, decision, day)
+                source_link = _telegram_message_link(
+                    candidate.chat_id, candidate.source_username, candidate.message_id
+                )
+                stamp = candidate.source_time.astimezone(ZoneInfo(self.settings.timezone)).strftime(
+                    "%Y-%m-%d %H:%M %Z"
+                )
+                await self.bot.send_message(
+                    self.settings.summary_target,
+                    (
+                        "检测到可复用的签到操作，请确认是否部署。\n"
+                        f"群组：{candidate.source_name}\n"
+                        f"源消息（{stamp}，{candidate.source_sender}）：{candidate.source_text[:300]}\n"
+                        f"Bot 回复：{candidate.bot_reply[:500]}\n"
+                        f"AI 判断（高置信）：{decision.reason}\n"
+                        f"建议自动发送：{decision.proposed_text}"
+                        + (f"\n来源链接：{source_link}" if source_link else "")
+                    ),
+                    buttons=[
+                        [
+                            Button.inline("同意并部署", data=f"ks:{candidate.chat_id}".encode()),
+                            Button.inline("今天忽略", data=f"ki:{candidate.chat_id}".encode()),
+                        ],
+                        [
+                            Button.inline("7 天忽略", data=f"k7:{candidate.chat_id}".encode()),
+                            Button.inline("永久忽略", data=f"kx:{candidate.chat_id}".encode()),
+                        ],
                     ],
-                    [
-                        Button.inline("7 天忽略", data=f"k7:{candidate.chat_id}".encode()),
-                        Button.inline("永久忽略", data=f"kx:{candidate.chat_id}".encode()),
-                    ],
-                ],
-                link_preview=False,
-            )
+                    link_preview=False,
+                )
+                return
         except Exception:
             log.exception("Check-in suggestion analysis failed for candidate=%s", candidate_key)
+
+    def _defer_checkin_suggestion(
+        self, candidate: CheckinSuggestionCandidate, exc: Exception, *, retry_count: int = 0
+    ) -> None:
+        now = dt.datetime.now(ZoneInfo(self.settings.timezone))
+        self.archive.defer_checkin_suggestion(
+            DeferredCheckinSuggestion(
+                chat_id=candidate.chat_id,
+                message_id=candidate.message_id,
+                source_name=candidate.source_name,
+                source_username=candidate.source_username,
+                source_sender=candidate.source_sender,
+                source_time=candidate.source_time,
+                source_text=candidate.source_text,
+                bot_reply=candidate.bot_reply,
+                retry_after=now,
+                retry_count=retry_count,
+                last_error=_safe_error(exc),
+            )
+        )
+
+    async def _retry_deferred_checkin_suggestions(
+        self, now: dt.datetime, *, force: bool = False
+    ) -> tuple[bool | None, int]:
+        status = await self._checkin_ai_status_available()
+        last_status = getattr(self, "_checkin_ai_last_status", None)
+        recovered = status is True and last_status is not True
+        self._checkin_ai_last_status = status if status is not None else last_status
+        if status is not True or (not force and not recovered):
+            return status, 0
+        launched = 0
+        for saved in self.archive.deferred_checkin_suggestions():
+            candidate_key = (saved.chat_id, saved.message_id)
+            if candidate_key in self._checkin_suggestion_candidates:
+                continue
+            if _checkin_suggestion_expired(
+                saved.source_time, max_age=CHECKIN_SUGGESTION_DEFERRED_MAX_AGE
+            ):
+                self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                log.info("Dropping expired deferred check-in suggestion candidate=%s", candidate_key)
+                continue
+            day = now.date()
+            if (
+                saved.chat_id in self._checkin_configs()
+                or self._checkin_suggestion_ignored(saved.chat_id, day)
+            ):
+                self.archive.delete_deferred_checkin_suggestion(*candidate_key)
+                continue
+            self.archive.reschedule_deferred_checkin_suggestion(*candidate_key, now)
+            self._checkin_suggestion_candidates[candidate_key] = CheckinSuggestionCandidate(
+                chat_id=saved.chat_id,
+                message_id=saved.message_id,
+                source_name=saved.source_name,
+                source_username=saved.source_username,
+                source_sender=saved.source_sender,
+                source_time=saved.source_time,
+                source_text=saved.source_text,
+                bot_reply=saved.bot_reply,
+            )
+            task = asyncio.create_task(
+                self._analyze_checkin_suggestion(candidate_key, wait_for_bot_reply=False, deferred=True),
+                name="deferred-checkin-suggestion",
+            )
+            self._checkin_suggestion_tasks.add(task)
+            task.add_done_callback(self._checkin_suggestion_tasks.discard)
+            launched += 1
+        return True, launched
+
+    async def _retry_ai_jobs(self, now: dt.datetime, *, force: bool = False) -> tuple[bool | None, int]:
+        status = await self._checkin_ai_status_available()
+        last_status = getattr(self, "_ai_retry_last_status", None)
+        recovered = status is True and last_status is not True
+        self._ai_retry_last_status = status if status is not None else last_status
+        if status is not True or (not force and not recovered):
+            if force:
+                log.info("AI retry request skipped provider_status=%s", status)
+            return status, 0
+        launched = 0
+        tasks = getattr(self, "_ai_retry_tasks", None)
+        if tasks is None:
+            tasks = self._ai_retry_tasks = set()
+        for job in self.archive.ai_retry_jobs():
+            if _checkin_suggestion_expired(job.created_at, max_age=AI_RETRY_MAX_AGE):
+                self.archive.delete_ai_retry_job(job.job_key)
+                continue
+            task = asyncio.create_task(self._run_ai_retry_job(job), name=f"ai-retry-{job.kind}")
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            launched += 1
+        log.info("AI retry jobs launched count=%d recovered=%s forced=%s", launched, recovered, force)
+        return True, launched
+
+    async def _run_ai_retry_job(self, job: AIRetryJob) -> None:
+        try:
+            payload = json.loads(job.payload)
+            if not isinstance(payload, dict):
+                raise ValueError("invalid AI retry payload")
+            chat_id = int(payload.get("chat_id")) if payload.get("chat_id") is not None else None
+            source = self.sources.get(chat_id) if chat_id is not None else None
+            if job.kind in {"alert", "topic"}:
+                if source is None:
+                    self.archive.delete_ai_retry_job(job.job_key)
+                    return
+                message_time = dt.datetime.fromisoformat(str(payload["message_time"]))
+                event = SimpleNamespace(
+                    chat_id=source.chat_id,
+                    is_group=True,
+                    message=SimpleNamespace(id=payload.get("message_id"), date=message_time),
+                )
+                if job.kind == "alert":
+                    await self._analyze_alert(source, str(payload["text"]), event, tuple(payload.get("signals", ())))
+                else:
+                    await self._notify_topic_subscriptions(
+                        source, str(payload["text"]), event, message_time, dt.datetime.now(dt.timezone.utc)
+                    )
+                return
+            if job.kind == "content":
+                if source is None:
+                    self.archive.delete_ai_retry_job(job.job_key)
+                    return
+                await self._classify_sources((source,), force=True)
+                return
+            if job.kind == "digest":
+                async def send_digest() -> bool:
+                    await self._send_digest_with_mode(
+                        self.settings.summary_target, advance_cursors=True
+                    )
+                    return True
+
+                result = await self._run_ai_with_persistence(
+                    "digest",
+                    payload,
+                    send_digest,
+                    job_key=job.job_key,
+                    initial_attempt=int(job.retry_count),
+                )
+                if result is True:
+                    self.archive.set_state("last_digest_day", str(payload.get("day", "")))
+                    self.archive.set_state("digest_retry_at", "")
+                return
+            if job.kind == "ask":
+                target = payload.get("target")
+                question = str(payload.get("question", "")).strip()
+                if target is None or not question:
+                    self.archive.delete_ai_retry_job(job.job_key)
+                    return
+                answer = await self._run_ai_with_persistence(
+                    "ask",
+                    payload,
+                    lambda: self._answer_question_value(question),
+                    job_key=job.job_key,
+                    initial_attempt=int(job.retry_count),
+                )
+                if answer is not None:
+                    await _send_long(self.bot, render_answer(answer), target=target)
+                return
+            self.archive.delete_ai_retry_job(job.job_key)
+        except Exception:
+            log.exception("AI retry job failed kind=%s key=%s", job.kind, job.job_key)
+
+    async def _checkin_ai_unavailable(self) -> bool:
+        return await self._checkin_ai_status_available() is False
+
+    async def _checkin_ai_status_available(self) -> bool | None:
+        primary_model = getattr(self.settings, "llm_model", "")
+        if not primary_model:
+            return None
+        models = [primary_model]
+        fallback_model = getattr(self.settings, "llm_fallback_model", None)
+        if fallback_model:
+            models.append(fallback_model)
+        try:
+            timeout = aiohttp.ClientTimeout(total=CHECKIN_SUGGESTION_STATUS_TIMEOUT_SECONDS)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    CHECKIN_SUGGESTION_STATUS_URL,
+                    headers={"Accept": "application/json"},
+                ) as response:
+                    if response.status != 200:
+                        log.warning("AI status probe returned http_status=%s", response.status)
+                        return None
+                    payload = await response.json(content_type=None)
+        except Exception as exc:
+            log.warning("Unable to read AI status source: %s", _safe_error(exc))
+            return None
+        available = _checkin_status_available(payload, models)
+        previous = getattr(self, "_provider_status_last_logged", object())
+        if available != previous:
+            log.info(
+                "AI status probe changed availability=%s models=%s",
+                available,
+                ",".join(models),
+            )
+            self._provider_status_last_logged = available
+        return available
+
+    async def _run_ai_with_persistence(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        operation: Any,
+        *,
+        job_key: str | None = None,
+        initial_attempt: int = 0,
+    ) -> Any | None:
+        """Retry a background AI operation, then persist it for /retry."""
+        attempt = initial_attempt
+        while True:
+            started = time.monotonic()
+            try:
+                result = await operation()
+            except Exception as exc:
+                delay = _checkin_suggestion_retry_delay(attempt)
+                attempt += 1
+                if attempt > _CHECKIN_SUGGESTION_BACKOFF_ATTEMPTS:
+                    self._enqueue_ai_retry_job(
+                        kind, payload, exc, retry_count=attempt, job_key=job_key
+                    )
+                    log.warning(
+                        "Persisting AI retry job kind=%s key=%s after %s attempts: %s",
+                        kind,
+                        job_key or "auto",
+                        attempt,
+                        _safe_error(exc),
+                    )
+                    return None
+                log.warning(
+                    "Temporary AI failure kind=%s; retrying in %ss: %s",
+                    kind,
+                    delay,
+                    _safe_error(exc),
+                )
+                await asyncio.sleep(delay)
+                continue
+            if job_key is not None:
+                self.archive.delete_ai_retry_job(job_key)
+            log.info(
+                "AI operation completed kind=%s attempt=%d elapsed_ms=%d persisted_job=%s",
+                kind,
+                attempt + 1,
+                (time.monotonic() - started) * 1000,
+                bool(job_key),
+            )
+            return result
+
+    def _enqueue_ai_retry_job(
+        self,
+        kind: str,
+        payload: dict[str, Any],
+        exc: Exception,
+        *,
+        retry_count: int,
+        job_key: str | None = None,
+    ) -> str:
+        now = dt.datetime.now(dt.timezone.utc)
+        key = job_key or f"{kind}:{now.timestamp()}"
+        self.archive.enqueue_ai_retry_job(
+            AIRetryJob(
+                job_key=key,
+                kind=kind,
+                payload=json.dumps(payload, ensure_ascii=False),
+                retry_after=now,
+                retry_count=retry_count,
+                last_error=_safe_error(exc),
+                created_at=now,
+            )
+        )
+        log.info("AI retry job persisted kind=%s key=%s retry_count=%d", kind, key, retry_count)
+        return key
 
     def _save_checkin_suggestion(
         self, candidate: CheckinSuggestionCandidate, decision: CheckinSuggestionDecision, day: str
@@ -1595,31 +2476,70 @@ class TelegramInsightService:
         )
 
     async def _notify_checkin_failure(self, chat_id: int, detail: str) -> None:
+        config = self._checkin_configs().get(chat_id)
+        escalation = ""
+        if config is not None and config.failure_streak >= CHECKIN_FAILURE_ESCALATION_DAYS:
+            escalation = (
+                f"\n升级提醒：该目标已连续失败 {config.failure_streak} 天，"
+                "请检查目标是否改名、命令是否失效或 Bot 是否异常。"
+            )
         await self.bot.send_message(
             self.settings.summary_target,
-            f"自动签到失败：{self._checkin_label(chat_id)}\n{detail[:500]}",
+            f"自动签到失败：{self._checkin_label(chat_id)}\n{detail[:500]}{escalation}",
+            buttons=self._checkin_failure_buttons(chat_id),
+            link_preview=False,
+        )
+
+    def _checkin_failure_buttons(self, chat_id: int) -> list[list[Any]]:
+        return [
+            [
+                Button.inline("继续保留", data=f"ku:{chat_id}".encode()),
+                Button.inline("关闭自动签到", data=f"kv:{chat_id}".encode()),
+            ],
+            [Button.inline("移除签到目标", data=f"kw:{chat_id}".encode())],
+        ]
+
+    async def _notify_checkin_unverified(self, chat_id: int, config: CheckinConfig) -> None:
+        if config.unverified_streak < CHECKIN_UNVERIFIED_ESCALATION_DAYS:
+            return
+        if config.unverified_streak % CHECKIN_UNVERIFIED_ESCALATION_DAYS:
+            return
+        await self.bot.send_message(
+            self.settings.summary_target,
+            (
+                f"自动签到连续 {config.unverified_streak} 天未检测到明确成功回复："
+                f"{self._checkin_label(chat_id)}\n"
+                "消息可能已成功，但 Bot 回复超出 20 秒或格式未被识别。请选择继续保留、关闭或移除。"
+            ),
+            buttons=self._checkin_failure_buttons(chat_id),
             link_preview=False,
         )
 
     async def _schedule_alert_analysis(self, event: Any) -> None:
         enabled, keywords = self._alert_config()
-        if not enabled or not getattr(event, "is_group", False):
+        subscriptions = self._topic_subscriptions()
+        if not enabled and not subscriptions:
+            return
+        if not getattr(event, "is_group", False):
             return
         source = self.sources.get(getattr(event, "chat_id", None))
         text = (getattr(event, "raw_text", "") or "").strip()
-        if source is None or len(text) < 8:
+        if source is None or len(text) < ALERT_MIN_CANDIDATE_LENGTH:
             return
         message_time = _event_message_time(event)
         now = dt.datetime.now(dt.timezone.utc)
         if now - message_time > ALERT_MAX_MESSAGE_AGE:
             return
         lowered = text.casefold()
-        signals = tuple(
-            signal
-            for signal in (*keywords, *ALERT_EVENT_HINTS)
-            if signal.casefold() in lowered
+        signals = _matching_alert_signals(lowered, keywords) if enabled else ()
+        topic_match = any(
+            int(item["chat_id"]) == source.chat_id
+            and str(item["keyword"]).casefold() in lowered
+            for item in subscriptions
         )
-        if not signals:
+        if not signals and not topic_match:
+            return
+        if signals and not _is_alert_candidate(text, signals):
             return
         task = asyncio.create_task(
             self._analyze_alert(source, text, event, signals), name="ai-event-alert"
@@ -1634,21 +2554,39 @@ class TelegramInsightService:
             now = dt.datetime.now(dt.timezone.utc)
             message_time = _event_message_time(event)
             context = self.archive.recent((source.chat_id,), ALERT_CONTEXT_MESSAGES)
-            decision = await self.llm.detect_event(
-                source.name, text, context, message_time, now
+            message_id = getattr(getattr(event, "message", None), "id", None)
+            payload = {
+                "chat_id": source.chat_id,
+                "message_id": message_id,
+                "source_name": source.name,
+                "source_username": source.username,
+                "text": text[:MAX_CHECKIN_TEXT_LENGTH],
+                "signals": list(signals),
+                "message_time": message_time.isoformat(),
+            }
+            job_key = f"alert:{source.chat_id}:{message_id}" if message_id else None
+            decision = await self._run_ai_with_persistence(
+                "alert",
+                payload,
+                lambda: self.llm.detect_event(
+                    source.name, _redact_for_llm(text), _redact_messages(context), message_time, now
+                ),
+                job_key=job_key,
             )
-            if not decision.alert:
+            if decision is None:
                 return
-            async with self._alert_lock:
-                if self._is_duplicate_alert(source.chat_id, decision, now):
-                    log.info(
-                        "Suppressed repeated event alert for chat id=%s topic=%s signals=%s",
-                        source.chat_id,
-                        decision.topic,
-                        ",".join(signals),
-                    )
-                    return
-                await self._send_alert(source, text, decision, event)
+            if decision.alert:
+                async with self._alert_lock:
+                    if self._is_duplicate_alert(source.chat_id, decision, now):
+                        log.info(
+                            "Suppressed repeated event alert for chat id=%s topic=%s signals=%s",
+                            source.chat_id,
+                            decision.topic,
+                            ",".join(signals),
+                        )
+                    elif not self._alert_topic_ignored(source.chat_id, decision.topic):
+                        await self._send_alert(source, text, decision, event)
+            await self._notify_topic_subscriptions(source, text, event, message_time, now)
         except Exception:
             log.exception("Event alert analysis failed for chat id=%s", source.chat_id)
 
@@ -1677,6 +2615,7 @@ class TelegramInsightService:
             link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}"
         else:
             link_text = ""
+        encoded = _encode_alert_feedback(source.chat_id, decision.topic)
         await self.bot.send_message(
             self.settings.summary_target,
             (
@@ -1686,12 +2625,64 @@ class TelegramInsightService:
                 f"新增信息：{decision.new_information}\n"
                 f"原消息：{text[:1200]}{link_text}"
             ),
+            buttons=[
+                [
+                    Button.inline("重要", data=f"af:important:{encoded}".encode()),
+                    Button.inline("忽略此主题", data=f"af:ignore:{encoded}".encode()),
+                ]
+            ],
             link_preview=False,
         )
         topic = _alert_topic_fingerprint(decision.topic)
         self._alert_last_sent[(source.chat_id, topic)] = AlertRecord(
             dt.datetime.now(dt.timezone.utc), decision.new_information
         )
+
+    async def _notify_topic_subscriptions(
+        self, source: SourceChat, text: str, event: Any, message_time: dt.datetime, now: dt.datetime
+    ) -> None:
+        subscriptions = self._topic_subscriptions()
+        matched = [item for item in subscriptions if int(item["chat_id"]) == source.chat_id and str(item["keyword"]).casefold() in text.casefold()]
+        if not matched:
+            return
+        changed = False
+        for item in matched:
+            last = _state_datetime(item.get("last_sent"), dt.timezone.utc)
+            if last is not None and now - last < TOPIC_SUBSCRIPTION_COOLDOWN:
+                continue
+            context = _redact_messages(self.archive.recent((source.chat_id,), ALERT_CONTEXT_MESSAGES))
+            message_id = getattr(getattr(event, "message", None), "id", None)
+            payload = {
+                "chat_id": source.chat_id,
+                "message_id": message_id,
+                "source_name": source.name,
+                "source_username": source.username,
+                "text": text[:MAX_CHECKIN_TEXT_LENGTH],
+                "keyword": str(item["keyword"]),
+                "message_time": message_time.isoformat(),
+            }
+            job_key = f"topic:{source.chat_id}:{message_id}:{item['keyword']}" if message_id else None
+            decision = await self._run_ai_with_persistence(
+                "topic",
+                payload,
+                lambda: self.llm.detect_event(source.name, _redact_for_llm(text), context, message_time, now),
+                job_key=job_key,
+            )
+            if decision is None:
+                continue
+            if not decision.alert or self._alert_topic_ignored(source.chat_id, decision.topic):
+                continue
+            item["last_sent"] = now.isoformat()
+            changed = True
+            link = getattr(getattr(event, "message", None), "id", None)
+            link_text = f"\nhttps://t.me/{source.username.lstrip('@')}/{link}" if link and source.username else ""
+            await self.bot.send_message(
+                self.settings.summary_target,
+                f"话题订阅提醒：{source.name}\n关键词：{item['keyword']}\n{decision.new_information}\n原消息：{text[:1000]}{link_text}",
+                link_preview=False,
+            )
+        if changed:
+            self._save_topic_subscriptions(subscriptions)
 
     async def _run_due_checkins(self, now: dt.datetime) -> None:
         today = now.date().isoformat()
@@ -1734,7 +2725,7 @@ class TelegramInsightService:
             else:
                 latest = configs.get(chat_id)
                 if latest is not None and latest.last_status == "sent_unverified":
-                    await self._notify_checkin_failure(chat_id, latest.last_detail)
+                    await self._notify_checkin_unverified(chat_id, latest)
 
     def _scheduled_checkin_at(
         self,
@@ -1811,7 +2802,16 @@ class TelegramInsightService:
             )
             if not messages:
                 return source.chat_id, "uncertain"
-            return source.chat_id, await self.llm.classify_content(messages)
+            payload = {"chat_id": source.chat_id, "source_name": source.name}
+            category = await self._run_ai_with_persistence(
+                "content",
+                payload,
+                lambda: self.llm.classify_content(_redact_messages(messages)),
+                job_key=f"content:{source.chat_id}",
+            )
+            if category is None:
+                raise RuntimeError("content classification queued for retry")
+            return source.chat_id, category
 
         results = await asyncio.gather(
             *(classify(source) for source in candidates), return_exceptions=True
@@ -1837,6 +2837,13 @@ class TelegramInsightService:
                     }
                 ),
             )
+        log.info(
+            "Content classification stored groups=%d adult=%d general=%d uncertain=%d",
+            len(updates),
+            sum(category == "adult" for category in updates.values()),
+            sum(category == "general" for category in updates.values()),
+            sum(category == "uncertain" for category in updates.values()),
+        )
 
     async def _summary_source_ids(self) -> tuple[int, ...]:
         await self._classify_sources(tuple(self.sources.values()))
@@ -1852,6 +2859,8 @@ class TelegramInsightService:
         while True:
             now = dt.datetime.now(zone)
             await self._run_due_checkins(now)
+            await self._retry_deferred_checkin_suggestions(now)
+            await self._retry_ai_jobs(now)
             await self._maybe_send_checkin_report(now)
             day_key = now.date().isoformat()
             attempt_day = self.archive.get_state("digest_attempt_day")
@@ -1875,12 +2884,19 @@ class TelegramInsightService:
                 attempt = attempts + 1
                 self.archive.set_state("digest_attempt_count", str(attempt))
                 try:
-                    await self._send_digest(self.settings.summary_target)
+                    await self._send_digest_with_mode(self.settings.summary_target, advance_cursors=True)
                     self.archive.set_state("last_digest_day", day_key)
                     self.archive.set_state("digest_retry_at", "")
                     self.archive.prune(self.settings.retention_days)
-                except Exception:
+                except Exception as exc:
                     log.exception("Scheduled digest failed")
+                    self._enqueue_ai_retry_job(
+                        "digest",
+                        {"day": day_key, "target": self.settings.summary_target},
+                        exc,
+                        retry_count=attempt,
+                        job_key=f"digest:{day_key}",
+                    )
                     self.archive.set_state(
                         "digest_retry_at",
                         (now + _digest_retry_delay(attempt)).isoformat(),
@@ -1918,30 +2934,69 @@ class TelegramInsightService:
         self.archive.set_state(CHECKIN_REPORT_STATE, day)
 
     async def _send_digest(self, target: int | str) -> None:
+        await self._send_digest_with_mode(target, advance_cursors=False)
+
+    async def _send_digest_with_mode(self, target: int | str, *, advance_cursors: bool) -> None:
         async with self._digest_lock:
             now = dt.datetime.now(dt.timezone.utc)
             source_ids = await self._summary_source_ids()
-            messages = self.archive.range(
-                source_ids,
-                now - dt.timedelta(hours=24),
-                now,
-                self.settings.summary_max_messages,
-            )
+            cursors = self._digest_cursors()
+            records: dict[tuple[int, int], StoredMessage] = {}
+            for chat_id in source_ids:
+                cursor = cursors.get(str(chat_id))
+                start = _state_datetime(cursor, dt.timezone.utc) if cursor else None
+                if start is None:
+                    start = now - dt.timedelta(hours=24)
+                else:
+                    # Small overlap preserves context for an ongoing topic without
+                    # turning the digest back into a full-history report.
+                    start -= dt.timedelta(hours=2)
+                for item in self.archive.range((chat_id,), start, now, self.settings.summary_max_messages):
+                    records[(item.chat_id, item.message_id)] = item
+            messages = sorted(records.values(), key=lambda item: item.sent_at)
+            messages = messages[-self.settings.summary_max_messages :]
             messages = limit_summary_messages(
-                messages, self.settings.summary_max_chars
+                _redact_messages(messages), self.settings.summary_max_chars
+            )
+            log.info(
+                "Digest preparation sources=%d messages=%d advance_cursors=%s",
+                len(source_ids),
+                len(messages),
+                advance_cursors,
             )
             if not messages:
                 await self.bot.send_message(target, "过去 24 小时没有可参与摘要的归档消息。")
+                if advance_cursors:
+                    self._set_digest_cursors(source_ids, now)
                 return
             now = dt.datetime.now(ZoneInfo(self.settings.timezone))
             digest = await self.llm.daily_digest(messages, now.date(), as_of=now)
             await _send_long(self.bot, digest, target=target)
+            log.info("Digest delivered messages=%d digest_chars=%d", len(messages), len(digest))
+            if advance_cursors:
+                self._set_digest_cursors(source_ids, dt.datetime.now(dt.timezone.utc))
+
+    def _digest_cursors(self) -> dict[str, str]:
+        try:
+            raw = json.loads(self.archive.get_state(DIGEST_CURSORS_STATE) or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def _set_digest_cursors(self, chat_ids: Sequence[int], value: dt.datetime) -> None:
+        cursors = self._digest_cursors()
+        stamp = value.astimezone(dt.timezone.utc).isoformat()
+        for chat_id in chat_ids:
+            cursors[str(chat_id)] = stamp
+        self.archive.set_state(DIGEST_CURSORS_STATE, json.dumps(cursors, ensure_ascii=False))
 
     async def _set_bot_commands(self) -> None:
         await self.bot(
             functions.bots.SetBotCommandsRequest(
                 scope=types.BotCommandScopeDefault(),
-                lang_code="en",
+                # An empty language code is Telegram's universal command menu.
+                # Restricting this to "en" hides it for Chinese-language clients.
+                lang_code="",
                 commands=[
                     types.BotCommand(command="groups", description="选择要归档的群组"),
                     types.BotCommand(command="recent", description="读取指定群组的最近消息"),
@@ -1950,10 +3005,12 @@ class TelegramInsightService:
                     types.BotCommand(command="content", description="管理成人内容摘要排除"),
                     types.BotCommand(command="checkin", description="管理自动签到"),
                     types.BotCommand(command="alerts", description="配置重大事件提醒"),
+                    types.BotCommand(command="topics", description="管理关键词话题订阅"),
                     types.BotCommand(command="refresh", description="刷新群组和机器人列表"),
                     types.BotCommand(command="backup", description="导出消息数据库备份"),
                     types.BotCommand(command="settings", description="设置每日推送"),
                     types.BotCommand(command="status", description="查看归档状态"),
+                    types.BotCommand(command="retry", description="手动重试签到识别"),
                     types.BotCommand(command="help", description="查看帮助"),
                 ],
             )
@@ -2055,6 +3112,18 @@ def _checkin_configs_from_state(value: str | None) -> dict[int, CheckinConfig]:
             topic_id=topic_id,
             last_status=str(raw_config.get("last_status", ""))[:40],
             last_detail=str(raw_config.get("last_detail", ""))[:300],
+            failure_streak=(
+                int(raw_config.get("failure_streak", 0))
+                if isinstance(raw_config.get("failure_streak", 0), int)
+                and 0 <= int(raw_config.get("failure_streak", 0)) <= 365
+                else 0
+            ),
+            unverified_streak=(
+                int(raw_config.get("unverified_streak", 0))
+                if isinstance(raw_config.get("unverified_streak", 0), int)
+                and 0 <= int(raw_config.get("unverified_streak", 0)) <= 365
+                else 0
+            ),
             history=history,
         )
         if len(configs) >= MAX_CHECKIN_TARGETS:
@@ -2076,6 +3145,8 @@ def _checkin_config_to_json(config: CheckinConfig) -> dict[str, str | int | bool
         "topic_id": config.topic_id,
         "last_status": config.last_status,
         "last_detail": config.last_detail,
+        "failure_streak": config.failure_streak,
+        "unverified_streak": config.unverified_streak,
         "history": [
             {"day": record.day, "at": record.at, "status": record.status, "detail": record.detail}
             for record in config.history[-CHECKIN_HISTORY_LIMIT:]
@@ -2120,7 +3191,16 @@ def _append_checkin_record(config: CheckinConfig, status: str, detail: str, now:
         detail=detail[:300],
     )
     history = tuple((*config.history, record)[-CHECKIN_HISTORY_LIMIT:])
-    return _replace_checkin(config, last_status=status, last_detail=detail[:300], history=history)
+    failure_streak = config.failure_streak + 1 if status in {"failed", "send_failed"} else 0
+    unverified_streak = config.unverified_streak + 1 if status == "sent_unverified" else 0
+    return _replace_checkin(
+        config,
+        last_status=status,
+        last_detail=detail[:300],
+        failure_streak=min(failure_streak, 365),
+        unverified_streak=min(unverified_streak, 365),
+        history=history,
+    )
 
 
 def _checkin_verification_status(
@@ -2128,6 +3208,7 @@ def _checkin_verification_status(
     *,
     from_bot: bool,
     target_kind: str | None,
+    direct_reply: bool = False,
 ) -> str | None:
     """Classify a likely check-in response without trusting ordinary group members."""
     normalized = re.sub(r"\s+", " ", text.casefold()).strip()
@@ -2138,17 +3219,34 @@ def _checkin_verification_status(
 
     # A bot target is already the direct recipient. For group targets, only a
     # message authored by a Telegram bot is trusted as the automated response.
-    trusted_sender = from_bot or target_kind == "bot"
+    # A direct reply to our just-sent message is strong evidence even when
+    # Telethon has not resolved the sender entity yet. Ordinary group replies
+    # remain untrusted unless authored by a Telegram bot.
+    trusted_sender = from_bot or target_kind == "bot" or direct_reply
     if not trusted_sender:
         return None
     command = bool(re.search(r"(?<![a-z0-9_])/(?:qd|checkin)(?![a-z0-9_])", normalized))
     explicit_success = any(keyword.casefold() in normalized for keyword in CHECKIN_SUCCESS_KEYWORDS)
+    # Some bots omit the word "签到" and only report the resulting reward.
+    reward_confirmation = bool(
+        re.search(
+            r"(?:恭喜|成功|完成|已领取|已获得|奖励|积分|金币|经验|排名).{0,24}(?:\d+\s*(?:分|积分|金币|经验|点)?|奖励|排名|连续|签到|打卡)",
+            normalized,
+        )
+        or re.search(r"(?:获得|领取).{0,16}(?:\d+|奖励|积分|金币|经验)", normalized)
+    )
     plain_checkin = "签到" in normalized and not any(
         marker in normalized for marker in ("请发送", "请输入", "回复", "输入")
     )
-    if command or explicit_success or plain_checkin:
+    if command or explicit_success or reward_confirmation or plain_checkin:
         return "verified"
     return None
+
+
+def _checkin_bot_username(text: str) -> str | None:
+    """Extract the explicit Bot username from a group check-in command."""
+    match = re.search(r"@([a-z][a-z0-9_]{4,31})", text, flags=re.IGNORECASE)
+    return f"@{match.group(1)}" if match is not None else None
 
 
 def _event_message_time(event: Any) -> dt.datetime:
@@ -2204,6 +3302,75 @@ def _is_literal_checkin_proposal(proposed_text: str, source_text: str) -> bool:
     return proposal.casefold() in source.casefold()
 
 
+def _checkin_suggestion_retry_delay(attempt: int) -> int:
+    """Return a bounded delay so an unavailable provider cannot cause a busy loop."""
+    return min(
+        CHECKIN_SUGGESTION_RETRY_MAX_SECONDS,
+        CHECKIN_SUGGESTION_RETRY_INITIAL_SECONDS * (2 ** min(max(attempt, 0), 10)),
+    )
+
+
+def _checkin_status_available(payload: Any, models: Sequence[str]) -> bool | None:
+    """Parse status.input.im without treating unknown/malformed data as an outage."""
+    if not isinstance(payload, dict):
+        return None
+    generated_at = payload.get("generated_at")
+    if not isinstance(generated_at, (int, float)):
+        return None
+    age = dt.datetime.now(dt.timezone.utc).timestamp() - generated_at
+    if age < -300 or age > CHECKIN_SUGGESTION_STATUS_MAX_AGE_SECONDS:
+        return None
+    services = payload.get("services") if isinstance(payload, dict) else None
+    if not isinstance(services, list):
+        return None
+    by_model = {
+        str(item.get("model")): item
+        for item in services
+        if isinstance(item, dict) and item.get("model")
+    }
+    known = [by_model[model] for model in models if model in by_model]
+    if not known:
+        return None
+    return any(
+        isinstance(item.get("last"), dict) and item["last"].get("ok") is True
+        for item in known
+    )
+
+
+def _checkin_suggestion_expired(
+    source_time: dt.datetime, *, max_age: dt.timedelta = CHECKIN_SUGGESTION_MAX_AGE
+) -> bool:
+    now = dt.datetime.now(dt.timezone.utc)
+    timestamp = source_time
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(dt.timezone.utc)
+    return now - timestamp > max_age
+
+
+def _next_checkin_suggestion_midnight(now: dt.datetime) -> dt.datetime:
+    if now.tzinfo is None:
+        raise ValueError("now must be timezone-aware")
+    return dt.datetime.combine(now.date() + dt.timedelta(days=1), dt.time.min, tzinfo=now.tzinfo)
+
+
+def _is_deferred_checkin_ai_error(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 404
+
+
+def _is_retryable_checkin_ai_error(exc: Exception) -> bool:
+    """Retry only transient provider failures; auth and malformed responses fail closed."""
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int):
+        return status_code in {408, 409, 425, 429} or status_code >= 500
+    name = type(exc).__name__.lower()
+    return any(
+        marker in name
+        for marker in ("connection", "timeout", "temporarilyunavailable", "ratelimit")
+    )
+
+
 def _telegram_message_link(chat_id: int, username: str | None, message_id: int) -> str | None:
     if username:
         return f"https://t.me/{username.lstrip('@')}/{message_id}"
@@ -2215,7 +3382,7 @@ def _telegram_message_link(chat_id: int, username: str | None, message_id: int) 
 
 def _parse_alert_keywords(value: Any) -> tuple[str, ...]:
     if isinstance(value, str):
-        values = re.split(r"[,，\\n]", value)
+        values = re.split(r"[,，\n]", value)
     elif isinstance(value, (list, tuple)):
         values = value
     else:
@@ -2223,9 +3390,27 @@ def _parse_alert_keywords(value: Any) -> tuple[str, ...]:
     result: list[str] = []
     for item in values:
         text = " ".join(str(item).split())[:40]
+        if text.startswith("/"):
+            continue
         if text and text.casefold() not in {value.casefold() for value in result}:
             result.append(text)
     return tuple(result[:20])
+
+
+def _matching_alert_signals(text: str, keywords: Sequence[str]) -> tuple[str, ...]:
+    matches: list[str] = []
+    for signal in (*keywords, *ALERT_EVENT_HINTS):
+        normalized = signal.casefold()
+        if normalized in text and normalized not in {item.casefold() for item in matches}:
+            matches.append(signal)
+    return tuple(matches)
+
+
+def _is_alert_candidate(text: str, signals: Sequence[str]) -> bool:
+    normalized = " ".join(text.casefold().split())
+    if not signals or normalized.endswith(("?", "？")):
+        return False
+    return not any(marker in normalized for marker in ALERT_NOISE_MARKERS)
 
 
 def _checkin_suggestion_text(value: str | None, chat_id: int) -> str:
@@ -2259,6 +3444,52 @@ def _safe_datetime(value: Any) -> str:
 def _safe_error(exc: Exception) -> str:
     text = " ".join(str(exc).split())
     return text[:300] or type(exc).__name__
+
+
+_SENSITIVE_PATTERNS = (
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), "[REDACTED_API_KEY]"),
+    (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{20,}\b"), "[REDACTED_BOT_TOKEN]"),
+    (re.compile(r"\b[A-Fa-f0-9]{32}\b"), "[REDACTED_HASH]"),
+    (re.compile(r"\b[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), "[REDACTED_EMAIL]"),
+    (re.compile(r"(?<!\d)(?:\+?\d[\d -]{7,}\d)(?!\d)"), "[REDACTED_PHONE]"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"), "[REDACTED_IP]"),
+)
+
+
+def _redact_for_llm(value: str) -> str:
+    redacted = value
+    for pattern, replacement in _SENSITIVE_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def _redact_messages(messages: Sequence[StoredMessage]) -> list[StoredMessage]:
+    return [
+        StoredMessage(
+            chat_id=item.chat_id,
+            message_id=item.message_id,
+            chat_name=_redact_for_llm(item.chat_name),
+            chat_username=item.chat_username,
+            sender_id=item.sender_id,
+            sender_name=_redact_for_llm(item.sender_name),
+            sent_at=item.sent_at,
+            text=_redact_for_llm(item.text),
+            reply_to_id=item.reply_to_id,
+        )
+        for item in messages
+    ]
+
+
+def _encode_alert_feedback(chat_id: int, topic: str) -> str:
+    value = f"{chat_id}|{_alert_topic_fingerprint(topic)}".encode()
+    return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+
+def _decode_alert_feedback(value: str) -> tuple[int, str]:
+    padded = value + "=" * (-len(value) % 4)
+    raw = base64.urlsafe_b64decode(padded.encode()).decode()
+    chat_id, topic = raw.split("|", 1)
+    return int(chat_id), topic[:100]
 
 
 CONTENT_STATUS_LABELS = {

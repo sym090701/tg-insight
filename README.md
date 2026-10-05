@@ -12,6 +12,10 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   (Asia/Shanghai) time.
 - Daily summaries rank cross-group, high-information developments first, then give
   a separate intelligence update for every group with archived activity.
+- Scheduled summaries are incremental per group: after a successful scheduled push,
+  each group's cursor advances. A manual `/summary` does not advance cursors, and
+  failed pushes are retried without losing unread messages. A small overlap is kept
+  so ongoing topics can be recognized as updates.
 - Digest records include their precise timestamp and age at analysis time. Older
   messages are not restated as fresh news; they can reappear only as context for a
   genuinely active, recently updated topic, and the summary must describe the new
@@ -37,12 +41,24 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   exchange represents a real reusable check-in. The private management Bot shows
   the source message, sender/time/link, Bot reply, AI reason, and exact proposed
   command. Only “同意并部署” creates the default 00:30 automatic check-in; “忽略”
-  does nothing.
+  does nothing. A model `404` for a verified candidate is retained in a dedicated
+  SQLite queue and retried together at the next UTC+8 midnight; completed,
+  ignored, configured, or seven-day-old candidates are removed.
 - Check-in evidence is monitored in every joined group, including groups not
   selected for archiving. Unselected groups are not written to the message
   database: their candidate message and Bot reply exist only in memory until the
   decision is sent. Suggested actions can be ignored for today, seven days, or
-  permanently per group.
+  permanently per group. If the configured AI endpoint is temporarily unavailable,
+  a candidate with a direct Bot reply, event alert, topic analysis, content
+  classification, or scheduled digest is retried with bounded exponential backoff
+  (30 seconds, 60 seconds, 120 seconds, 240 seconds, 480 seconds, then 15 minutes).
+  After the bounded attempts, the candidate is stored in SQLite. The service checks
+  `https://status.input.im/api/status` and retries all stored candidates once the
+  configured models are reported available. The actual API response remains
+  authoritative; malformed or unreachable status data never discards evidence.
+  Candidates older than 7 days expire automatically, and a successful suggestion is
+  sent at most once per group per day. `/retry` manually wakes every persisted AI
+  task after the status probe reports an available model.
 - `/alerts` enables major-event alerts. Keywords are only candidate signals: AI
   verifies the target message against its timestamp and recent same-group context,
   ignores stale forwards and ordinary discussion, and suppresses repeated topics
@@ -50,6 +66,17 @@ Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
   a consistent SQLite backup and sends it to the authorized user; the seven newest
   backups are retained. The backup contains archived chat history, so treat it as
   sensitive data.
+- `/topics` watches selected archived groups for user-defined keywords and sends a
+  separate AI-verified update with a cooldown. Topic subscriptions work even when
+  broad major-event alerts are disabled. Alert messages provide feedback buttons
+  for marking a topic important or ignoring that topic permanently.
+- Scheduled check-ins track consecutive failure days. After three consecutive failed
+  days, the private notification is explicitly escalated with the target and latest
+  error detail.
+- Before archived messages, event context, or check-in evidence is sent to the LLM,
+  common API keys, Bot tokens, hashes, email addresses, phone numbers, and IP
+  addresses are replaced in the model-only copy. Local SQLite records and Telegram
+  notifications retain the original source text.
 - LLM prompts treat all Telegram content as untrusted data and cannot perform Telegram actions.
 - Archive size, free disk reserve, digest input, and automatic retries have hard limits.
 
@@ -84,9 +111,11 @@ Only IDs in `TG_ALLOWED_USER_IDS` can use the bot.
 /content          Classify groups; reanalyze a page or every selected group
 /checkin          Add a group/Bot, configure text/time/Topic, history, toggle, or run now
 /alerts           Configure major-event alert switch and keywords
+/topics           Configure per-group keyword subscriptions
 /refresh          Refresh joined groups and Bot targets
 /backup           Export a consistent SQLite archive backup to the private Bot chat
 /status           Show archive size, source chats, schedule, and model
+/retry            Manually retry persisted check-in analysis candidates
 /help             Show command help
 ```
 

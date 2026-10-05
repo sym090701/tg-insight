@@ -5,6 +5,7 @@ import datetime as dt
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -74,17 +75,43 @@ class InsightLLM:
     async def _complete(self, messages: list[dict[str, str]], temperature: float):
         async with self._request_slots:
             models = (self.model,) + ((self.fallback_model,) if self.fallback_model else ())
+            started = time.monotonic()
+            input_chars = sum(len(str(message.get("content", ""))) for message in messages)
+            log.info(
+                "LLM request started models=%s messages=%d input_chars=%d temperature=%s",
+                ",".join(models),
+                len(messages),
+                input_chars,
+                temperature,
+            )
             for index, model in enumerate(models):
                 try:
-                    return await self.client.chat.completions.create(
+                    response = await self.client.chat.completions.create(
                         model=model,
                         messages=messages,
                         temperature=temperature,
                     )
+                    log.info(
+                        "LLM request completed model=%s fallback=%s elapsed_ms=%d output_chars=%d",
+                        model,
+                        index > 0,
+                        (time.monotonic() - started) * 1000,
+                        _response_content_length(response),
+                    )
+                    return response
                 except Exception as exc:
+                    status = getattr(exc, "status_code", None)
+                    log.warning(
+                        "LLM request failed model=%s fallback_available=%s error_type=%s status=%s elapsed_ms=%d",
+                        model,
+                        index + 1 < len(models) and _should_use_fallback(exc),
+                        type(exc).__name__,
+                        status if isinstance(status, int) else "none",
+                        (time.monotonic() - started) * 1000,
+                    )
                     if index + 1 == len(models) or not _should_use_fallback(exc):
                         raise
-                    log.warning("Primary LLM model unavailable; using configured fallback")
+                    log.warning("Primary LLM model unavailable; using configured fallback model=%s", models[index + 1])
         raise RuntimeError("LLM request did not select a model")
 
     async def query_terms(self, question: str) -> list[str]:
@@ -193,10 +220,14 @@ class InsightLLM:
                         "with critical or high decision value, such as a confirmed service outage or "
                         "security incident, account/asset risk, material policy or price change, hard "
                         "deadline, or a broad-impact official announcement. A concrete, time-sensitive "
-                        "opportunity may qualify when missing it has a meaningful cost. "
-                        "Do not alert for greetings, routine releases or activities, opinions, hype, "
-                        "vague rumours, historical forwards, quoted old news, repeated conclusions, or "
-                        "ordinary discussion. The target message timestamp is decisive: old information "
+                        "opportunity may qualify only when it has a specific deadline and missing it has "
+                        "a meaningful cost. Require an explicit factual claim plus a concrete impact, "
+                        "scope, deadline, mitigation, or action the user should take. Treat an official "
+                        "source, a direct operational status, or independently specific evidence as more "
+                        "credible than unsupported assertions. Do not alert for questions, requests for "
+                        "confirmation, routine maintenance, routine releases or activities, opinions, "
+                        "hype, vague rumours, historical forwards, quoted old news, repeated conclusions, "
+                        "or ordinary discussion. The target message timestamp is decisive: old information "
                         "is not new just because it was mentioned again. Recent context is only for "
                         "checking whether this target message adds a real development. For an ongoing "
                         "topic, alert only when the target message adds a concrete new status, decision, "
@@ -564,7 +595,23 @@ def _content_category(value: str) -> str:
 def _should_use_fallback(exc: Exception) -> bool:
     if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError)):
         return True
-    return isinstance(exc, APIStatusError) and exc.status_code >= 500
+    if not isinstance(exc, APIStatusError):
+        return False
+    # OpenAI-compatible gateways commonly report an unavailable model as 404
+    # (and some use 400 with a model_not_found payload). Try Terra in both cases.
+    if exc.status_code >= 500 or exc.status_code == 404:
+        return True
+    message = str(exc).casefold()
+    return "model_not_found" in message or "not supported by any configured account" in message
+
+
+def _response_content_length(response: object) -> int:
+    """Return a safe diagnostic size without assuming a particular SDK response type."""
+    try:
+        content = response.choices[0].message.content  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, TypeError):
+        return 0
+    return len(content or "")
 
 
 def _fallback_terms(question: str) -> list[str]:

@@ -4,9 +4,11 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 
 from . import __version__
 from .config import ConfigError, Settings
+from .health import is_healthy
 from .service import TelegramInsightService
 
 
@@ -18,6 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth.add_argument("--phone", default=os.environ.get("TG_PHONE"))
     subcommands.add_parser("run", help="Run archive, bot and scheduler")
     subcommands.add_parser("check-config", help="Validate environment configuration")
+    subcommands.add_parser("healthcheck", help="Check whether the running service is ready")
     return parser
 
 
@@ -30,11 +33,20 @@ async def _run(args: argparse.Namespace, settings: Settings) -> None:
 
 
 def main() -> None:
+    # Keep app diagnostics useful without enabling verbose protocol dumps from
+    # dependencies such as Telethon or httpx. Message bodies and credentials
+    # are never logged by the application.
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO").upper(),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(asctime)s.%(msecs)03dZ %(levelname)s pid=%(process)d %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    logging.Formatter.converter = time.gmtime
+    for name in ("telethon", "httpx", "httpcore", "openai", "aiohttp"):
+        logging.getLogger(name).setLevel(logging.WARNING)
     args = build_parser().parse_args()
+    if args.command == "healthcheck":
+        raise SystemExit(0 if is_healthy() else 1)
     try:
         settings = Settings.from_env()
     except ConfigError as exc:
