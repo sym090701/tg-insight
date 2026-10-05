@@ -2,6 +2,11 @@
 
 Lightweight Telegram group archiving, daily summaries, and grounded history Q&A.
 
+On first private-chat use, the Bot asks you to choose `中文` or `English`. The
+choice is stored in the local SQLite state and controls Bot menus, notifications,
+summaries, alerts, check-in reports, and AI answers. Use `/settings` to switch
+languages later; proactive notifications wait until a language has been selected.
+
 ## Behavior
 
 - A Telethon user session discovers its joined group chats; sources can be fixed in

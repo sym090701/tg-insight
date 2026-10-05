@@ -71,6 +71,10 @@ class InsightLLM:
         self.model = model
         self.fallback_model = fallback_model if fallback_model != model else None
         self._request_slots = asyncio.Semaphore(3)
+        self.output_language = "zh"
+
+    def _language_instruction(self) -> str:
+        return "Respond in English." if getattr(self, "output_language", "zh") == "en" else "Respond in Chinese."
 
     async def _complete(self, messages: list[dict[str, str]], temperature: float):
         async with self._request_slots:
@@ -170,7 +174,7 @@ class InsightLLM:
                     "role": "system",
                     "content": (
                         "Answer the user's question using only the supplied Telegram records. "
-                        "Reply in the user's language. Cite factual statements with [S1], [S2], "
+                        f"{self._language_instruction()} Cite factual statements with [S1], [S2], "
                         "and so on. If the records do not establish the answer, say so clearly. "
                         + UNTRUSTED_NOTICE
                     ),
@@ -234,10 +238,11 @@ class InsightLLM:
                         "impact, deadline, number, or mitigation; set is_update true and describe that "
                         "change in new_information. Never alert based on context alone. "
                         "Return JSON only with exactly these fields: {\"alert\":true|false,"
-                        "\"priority\":\"critical\"|\"high\"|\"none\",\"reason\":\"short Chinese "
-                        "reason\",\"topic\":\"short stable Chinese topic\",\"new_information\":\"short "
-                        "Chinese statement of what is newly known\",\"is_update\":true|false}. If alert "
+                        "\"priority\":\"critical\"|\"high\"|\"none\",\"reason\":\"short reason "
+                        "\",\"topic\":\"short stable topic\",\"new_information\":\"short "
+                        "statement of what is newly known\",\"is_update\":true|false}. If alert "
                         "is false, use priority none and empty remaining strings. "
+                        f"{self._language_instruction()} "
                         + UNTRUSTED_NOTICE
                     ),
                 },
@@ -300,8 +305,9 @@ class InsightLLM:
                         "from Source message only, suitable to send verbatim as the recurring action; "
                         "never invent, repair, translate, or copy any command from Bot reply. "
                         "Return JSON only: {\"should_suggest\":true|false,\"confidence\":\"high\"|"
-                        "\"none\",\"reason\":\"short Chinese reason\",\"proposed_text\":\"exact "
+                        "\"none\",\"reason\":\"short reason\",\"proposed_text\":\"exact "
                         "source excerpt\"}. If false, confidence must be none and other strings empty. "
+                        f"{self._language_instruction()} "
                         + UNTRUSTED_NOTICE
                     ),
                 },
@@ -371,7 +377,7 @@ class InsightLLM:
                         "S is confirmed and broad, urgent, or immediately consequential; A is "
                         "material and actionable; B is a useful lead. Do not inflate casual "
                         "discussion into an event. Apply the timestamp and ongoing-topic rules "
-                        "strictly. Reply in Chinese in at most 400 Chinese characters. "
+                        f"strictly. {self._language_instruction()} Keep the response concise, at most 400 characters. "
                         f"Analysis cutoff: {reference_time.isoformat()}. "
                         + SUMMARY_TIME_RULES + " "
                         + UNTRUSTED_NOTICE
@@ -409,8 +415,8 @@ class InsightLLM:
                         "[B]: S is confirmed and broad, urgent, or immediately consequential; A "
                         "is material and actionable; B is a useful lead. Only use evidence in the "
                         "records, preserve available source URLs, and do not exaggerate uncertain "
-                        "claims. Apply the timestamp and ongoing-topic rules strictly. Reply in "
-                        "Chinese in at most 400 Chinese characters. "
+                        "claims. Apply the timestamp and ongoing-topic rules strictly. "
+                        f"{self._language_instruction()} Keep the response concise, at most 400 characters. "
                         + SUMMARY_TIME_RULES + " "
                         + UNTRUSTED_NOTICE
                     ),
@@ -439,9 +445,9 @@ class InsightLLM:
                 {
                     "role": "system",
                     "content": (
-                        "Produce an information-first Chinese Telegram daily briefing from separate "
-                        "group intelligence updates. Output exactly two sections: \"今日最重要信息\" "
-                        "followed by a numbered cross-group ranking, then \"分群情报\" with a "
+                        "Produce an information-first Telegram daily briefing from separate "
+                        f"group intelligence updates. Output exactly two sections: \"{'Top priorities' if getattr(self, 'output_language', 'zh') == 'en' else '今日最重要信息'}\" "
+                        f"followed by a numbered cross-group ranking, then \"{'Group intelligence' if getattr(self, 'output_language', 'zh') == 'en' else '分群情报'}\" with a "
                         "clearly labelled subsection for every supplied group. Put S items before "
                         "A, then B. Prioritize confirmed events with broad impact, urgency, a "
                         "decision or timing consequence, scarce useful information, actionable "
@@ -449,7 +455,7 @@ class InsightLLM:
                         "links when available. Use each item's timestamp and freshness. Do not "
                         "invent facts, combine unrelated groups, promote casual discussion as "
                         "important news, or present an old item as new without a newer continuation. "
-                        f"Analysis cutoff: {reference_time.isoformat()}. "
+                        f"{self._language_instruction()} Analysis cutoff: {reference_time.isoformat()}. "
                         + SUMMARY_TIME_RULES + " "
                         + UNTRUSTED_NOTICE
                     ),
@@ -473,7 +479,7 @@ class InsightLLM:
         return (response.choices[0].message.content or "").strip()
 
 
-def render_answer(answer: Answer) -> str:
+def render_answer(answer: Answer, language: str = "zh") -> str:
     lines = [answer.text or "No grounded answer was produced."]
     if answer.sources:
         cited = {
@@ -482,7 +488,7 @@ def render_answer(answer: Answer) -> str:
             if 1 <= int(value) <= len(answer.sources)
         }
         indexes = sorted(cited) if cited else list(range(1, min(12, len(answer.sources)) + 1))
-        lines.extend(["", "来源："])
+        lines.extend(["", "Sources:" if language == "en" else "来源："])
         for index in indexes:
             item = answer.sources[index - 1]
             stamp = item.sent_at.strftime("%Y-%m-%d %H:%M")

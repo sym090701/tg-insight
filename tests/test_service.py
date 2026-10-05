@@ -53,6 +53,7 @@ from tg_insight.service import (
     _encode_alert_feedback,
     _decode_alert_feedback,
     _append_checkin_record,
+    _localize_text,
     split_message,
 )
 
@@ -66,6 +67,37 @@ def test_split_message_preserves_content() -> None:
 
 def test_split_message_leaves_short_text_alone() -> None:
     assert split_message("short") == ["short"]
+
+
+def test_language_translation_is_single_language_and_preserves_commands() -> None:
+    text = "可用命令：\n/groups - 选择要归档的群组\n每日推送：开启"
+    translated = _localize_text(text, "en")
+    assert "Available commands:" in translated
+    assert "Choose a group" not in translated
+    assert "/groups" in translated
+    assert "每日推送" not in translated
+
+
+def test_language_preference_is_persisted_and_invalid_values_are_rejected() -> None:
+    state: dict[str, str] = {}
+
+    class Archive:
+        def get_state(self, key):
+            return state.get(key)
+
+        def set_state(self, key, value):
+            state[key] = value
+
+    service = object.__new__(TelegramInsightService)
+    service.archive = Archive()
+    service.llm = SimpleNamespace(output_language="zh")
+
+    assert service._language() is None
+    service._set_language("en")
+    assert service._language() == "en"
+    assert service.llm.output_language == "en"
+    with pytest.raises(ValueError):
+        service._set_language("fr")
 
 
 def test_digest_retry_delay_is_bounded() -> None:
