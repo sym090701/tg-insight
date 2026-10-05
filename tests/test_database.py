@@ -1,7 +1,13 @@
 import datetime as dt
 from types import SimpleNamespace
 
-from tg_insight.database import Archive, DeferredCheckinSuggestion, StoredMessage
+from tg_insight.database import (
+    AIRetryJob,
+    Archive,
+    DeferredCheckinSuggestion,
+    MessageWriteResult,
+    StoredMessage,
+)
 
 
 NOW = dt.datetime(2026, 8, 18, 12, 0, tzinfo=dt.timezone.utc)
@@ -27,8 +33,9 @@ def message(message_id: int, text: str, *, minutes: int = 0) -> StoredMessage:
 def test_upsert_range_and_private_group_link(tmp_path) -> None:
     archive = make_archive(tmp_path)
     archive.initialize()
-    archive.upsert(message(1, "first value"))
-    archive.upsert(message(1, "updated value"))
+    assert archive.upsert(message(1, "first value")) is MessageWriteResult.INSERTED
+    assert archive.upsert(message(1, "first value")) is MessageWriteResult.UNCHANGED
+    assert archive.upsert(message(1, "updated value")) is MessageWriteResult.UPDATED
 
     rows = archive.range(
         [-1001234567890], NOW - dt.timedelta(hours=1), NOW + dt.timedelta(hours=1), 10
@@ -117,6 +124,26 @@ def test_deferred_checkin_suggestions_are_durable_and_rescheduled(tmp_path) -> N
     assert archive.due_deferred_checkin_suggestions(next_retry + dt.timedelta(days=1)) == []
 
 
+def test_ai_retry_jobs_are_durable_and_deletable(tmp_path) -> None:
+    archive = make_archive(tmp_path)
+    archive.initialize()
+    job = AIRetryJob(
+        job_key="alert:-1001:42",
+        kind="alert",
+        payload='{"chat_id": -1001}',
+        retry_after=NOW,
+        retry_count=6,
+        last_error="HTTP 503",
+        created_at=NOW,
+    )
+    archive.enqueue_ai_retry_job(job)
+    jobs = archive.ai_retry_jobs()
+    assert len(jobs) == 1
+    assert jobs[0] == job
+    archive.delete_ai_retry_job(job.job_key)
+    assert archive.ai_retry_jobs() == []
+
+
 def test_archive_evicts_oldest_messages_at_hard_limit(tmp_path) -> None:
     archive = make_archive(tmp_path, max_messages=2)
     archive.initialize()
@@ -139,7 +166,7 @@ def test_archive_rejects_write_below_free_space_reserve(tmp_path, monkeypatch) -
         lambda _path: SimpleNamespace(free=0),
     )
 
-    assert archive.upsert(message(1, "must not be stored")) is False
+    assert archive.upsert(message(1, "must not be stored")) is MessageWriteResult.SKIPPED
     assert archive.count([-1001234567890]) == 0
 
 
@@ -149,5 +176,5 @@ def test_archive_rejects_writes_after_reaching_byte_limit(tmp_path) -> None:
     )
     archive.initialize()
 
-    assert archive.upsert(message(1, "must not be stored")) is False
+    assert archive.upsert(message(1, "must not be stored")) is MessageWriteResult.SKIPPED
     assert archive.count([-1001234567890]) == 0

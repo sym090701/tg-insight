@@ -7,11 +7,21 @@ import shutil
 import sqlite3
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Iterable, Sequence
 
 
 log = logging.getLogger("tg_insight.database")
+
+
+class MessageWriteResult(Enum):
+    """Outcome of storing one Telegram message."""
+
+    INSERTED = "inserted"
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    SKIPPED = "skipped"
 
 
 @dataclass(frozen=True)
@@ -49,6 +59,17 @@ class DeferredCheckinSuggestion:
     retry_after: dt.datetime
     retry_count: int
     last_error: str
+
+
+@dataclass(frozen=True)
+class AIRetryJob:
+    job_key: str
+    kind: str
+    payload: str
+    retry_after: dt.datetime
+    retry_count: int
+    last_error: str
+    created_at: dt.datetime
 
 
 class Archive:
@@ -134,6 +155,18 @@ class Archive:
                 );
                 CREATE INDEX IF NOT EXISTS idx_deferred_checkin_retry_after
                     ON deferred_checkin_suggestions(retry_after);
+
+                CREATE TABLE IF NOT EXISTS ai_retry_jobs (
+                    job_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    retry_after TEXT NOT NULL,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_ai_retry_jobs_retry_after
+                    ON ai_retry_jobs(retry_after);
                 """
             )
             self._message_count = int(
@@ -141,50 +174,59 @@ class Archive:
             )
             self._enforce_message_limit(conn)
 
-    def upsert(self, message: StoredMessage) -> bool:
+    def upsert(self, message: StoredMessage) -> MessageWriteResult:
         text = _clean_text(message.text)
         if not text:
-            return False
-        if not self._has_free_space():
-            return False
-        if not self._has_capacity():
-            return False
+            return MessageWriteResult.SKIPPED
+        sent_at = _utc_iso(message.sent_at)
+        values = (
+            message.chat_name,
+            message.chat_username,
+            message.sender_id,
+            message.sender_name,
+            sent_at,
+            text,
+            message.reply_to_id,
+        )
         with self.connect() as conn:
-            exists = conn.execute(
-                "SELECT 1 FROM messages WHERE chat_id=? AND message_id=?",
+            existing = conn.execute(
+                """
+                SELECT chat_name, chat_username, sender_id, sender_name, sent_at, text, reply_to_id
+                FROM messages WHERE chat_id=? AND message_id=?
+                """,
                 (message.chat_id, message.message_id),
             ).fetchone()
+            if existing is not None:
+                if tuple(existing) == values:
+                    return MessageWriteResult.UNCHANGED
+                conn.execute(
+                    """
+                    UPDATE messages
+                    SET chat_name=?, chat_username=?, sender_id=?, sender_name=?, sent_at=?, text=?, reply_to_id=?
+                    WHERE chat_id=? AND message_id=?
+                    """,
+                    (*values, message.chat_id, message.message_id),
+                )
+                return MessageWriteResult.UPDATED
+
+            if not self._has_free_space() or not self._has_capacity():
+                return MessageWriteResult.SKIPPED
             conn.execute(
                 """
                 INSERT INTO messages (
                     chat_id, message_id, chat_name, chat_username, sender_id,
                     sender_name, sent_at, text, reply_to_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(chat_id, message_id) DO UPDATE SET
-                    chat_name=excluded.chat_name,
-                    chat_username=excluded.chat_username,
-                    sender_id=excluded.sender_id,
-                    sender_name=excluded.sender_name,
-                    sent_at=excluded.sent_at,
-                    text=excluded.text,
-                    reply_to_id=excluded.reply_to_id
                 """,
                 (
                     message.chat_id,
                     message.message_id,
-                    message.chat_name,
-                    message.chat_username,
-                    message.sender_id,
-                    message.sender_name,
-                    _utc_iso(message.sent_at),
-                    text,
-                    message.reply_to_id,
+                    *values,
                 ),
             )
-            if exists is None:
-                self._message_count = self._current_count(conn) + 1
+            self._message_count = self._current_count(conn) + 1
             self._enforce_message_limit(conn)
-        return True
+        return MessageWriteResult.INSERTED
 
     def delete(self, chat_id: int, message_ids: Iterable[int]) -> None:
         ids = tuple(message_ids)
@@ -413,6 +455,17 @@ class Archive:
             ).fetchall()
         return [_row_to_deferred_checkin_suggestion(row) for row in rows]
 
+    def deferred_checkin_suggestions(self) -> list[DeferredCheckinSuggestion]:
+        """Return all candidates waiting for an AI provider to recover."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM deferred_checkin_suggestions
+                ORDER BY retry_after ASC, source_time ASC
+                """
+            ).fetchall()
+        return [_row_to_deferred_checkin_suggestion(row) for row in rows]
+
     def reschedule_deferred_checkin_suggestion(
         self, chat_id: int, message_id: int, retry_after: dt.datetime
     ) -> None:
@@ -432,6 +485,42 @@ class Archive:
                 "DELETE FROM deferred_checkin_suggestions WHERE chat_id=? AND message_id=?",
                 (chat_id, message_id),
             )
+
+    def enqueue_ai_retry_job(self, job: AIRetryJob) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ai_retry_jobs (
+                    job_key, kind, payload, retry_after, retry_count, last_error, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_key) DO UPDATE SET
+                    kind=excluded.kind,
+                    payload=excluded.payload,
+                    retry_after=excluded.retry_after,
+                    retry_count=excluded.retry_count,
+                    last_error=excluded.last_error
+                """,
+                (
+                    job.job_key,
+                    job.kind,
+                    job.payload,
+                    _utc_iso(job.retry_after),
+                    job.retry_count,
+                    job.last_error[:500],
+                    _utc_iso(job.created_at),
+                ),
+            )
+
+    def ai_retry_jobs(self) -> list[AIRetryJob]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ai_retry_jobs ORDER BY retry_after ASC, created_at ASC"
+            ).fetchall()
+        return [_row_to_ai_retry_job(row) for row in rows]
+
+    def delete_ai_retry_job(self, job_key: str) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM ai_retry_jobs WHERE job_key=?", (job_key,))
 
     def backup_to(self, destination: Path) -> None:
         """Create a consistent SQLite backup without copying a live WAL file."""
@@ -497,4 +586,16 @@ def _row_to_deferred_checkin_suggestion(row: sqlite3.Row) -> DeferredCheckinSugg
         retry_after=dt.datetime.fromisoformat(str(row["retry_after"])),
         retry_count=int(row["retry_count"]),
         last_error=str(row["last_error"]),
+    )
+
+
+def _row_to_ai_retry_job(row: sqlite3.Row) -> AIRetryJob:
+    return AIRetryJob(
+        job_key=str(row["job_key"]),
+        kind=str(row["kind"]),
+        payload=str(row["payload"]),
+        retry_after=dt.datetime.fromisoformat(str(row["retry_after"])),
+        retry_count=int(row["retry_count"]),
+        last_error=str(row["last_error"]),
+        created_at=dt.datetime.fromisoformat(str(row["created_at"])),
     )

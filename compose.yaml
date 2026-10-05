@@ -1,7 +1,7 @@
 services:
   tg-insight:
     build: .
-    image: tg-insight:0.1.29
+    image: tg-insight:0.1.38
     container_name: tg-insight
     command: ["run"]
     restart: unless-stopped
@@ -25,8 +25,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: "50m"
+        max-file: "5"
     healthcheck:
       test: ["CMD", "tg-insight", "healthcheck"]
       interval: 30s

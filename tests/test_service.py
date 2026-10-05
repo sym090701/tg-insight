@@ -17,11 +17,13 @@ from tg_insight.service import (
     CHECKIN_OFFSET_MAX_MS,
     CHECKIN_OFFSET_MIN_MS,
     CheckinConfig,
+    CheckinVerificationError,
     EventDecision,
     DEFAULT_RECENT_MESSAGES,
     SourceChat,
     TelegramInsightService,
     _checkin_configs_from_state,
+    _checkin_bot_username,
     _alert_topic_fingerprint,
     _classification_is_current,
     _checkin_verification_status,
@@ -287,11 +289,97 @@ async def test_outbound_bot_command_is_not_checkin_verification() -> None:
     assert waiter.result() == ("verified", "签到")
 
 
+def test_checkin_bot_username_is_extracted_only_when_explicit() -> None:
+    assert _checkin_bot_username("/checkin@WantButlerBot") == "@WantButlerBot"
+    assert _checkin_bot_username("@iWuMingBot /qd") == "@iWuMingBot"
+    assert _checkin_bot_username("/checkin") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("private_reply", "expected_status"),
+    [
+        ("签到成功，获得 10 积分", "verified"),
+        ("签到失败，请稍后重试", "failed"),
+    ],
+)
+async def test_group_checkin_is_verified_by_new_target_bot_private_reply(
+    private_reply: str, expected_status: str
+) -> None:
+    state = {
+        "checkin_configs": (
+            '{"-1001":{"enabled":true,"text":"/checkin@TargetCheckinBot",'
+            '"hour":0,"minute":30}}'
+        )
+    }
+
+    class Archive:
+        def get_state(self, key):
+            return state.get(key)
+
+        def set_state(self, key, value):
+            state[key] = value
+
+    class User:
+        def __init__(self):
+            self.iteration = 0
+
+        async def get_entity(self, username):
+            assert username == "@TargetCheckinBot"
+            return SimpleNamespace(id=77, bot=True)
+
+        async def get_peer_id(self, _entity):
+            return 77
+
+        async def send_message(self, entity, text, **_kwargs):
+            assert entity == "group"
+            assert text == "/checkin@TargetCheckinBot"
+            return SimpleNamespace(id=100)
+
+        async def iter_messages(self, _entity, **_kwargs):
+            self.iteration += 1
+            if self.iteration == 1:
+                yield SimpleNamespace(id=40, out=False, raw_text="昨天签到成功")
+                return
+            # The user's new outbound command must not count as the Bot reply.
+            yield SimpleNamespace(id=42, out=True, raw_text="/checkin")
+            yield SimpleNamespace(id=41, out=False, raw_text=private_reply)
+
+    service = object.__new__(TelegramInsightService)
+    service.settings = SimpleNamespace(timezone="Asia/Shanghai")
+    service.archive = Archive()
+    service.user = User()
+    service.available_checkin_targets = {
+        -1001: SourceChat(
+            entity="group",
+            chat_id=-1001,
+            name="签到群",
+            username=None,
+            target_kind="group",
+        )
+    }
+    service._checkin_lock = asyncio.Lock()
+    service._checkin_waiters = {}
+    service._checkin_sent_message_ids = {}
+
+    if expected_status == "failed":
+        with pytest.raises(CheckinVerificationError):
+            await service._send_checkin(-1001, mark_today=False)
+    else:
+        await service._send_checkin(-1001, mark_today=False)
+
+    saved = _checkin_configs_from_state(state["checkin_configs"])[-1001]
+    assert saved.last_status == expected_status
+    assert saved.last_detail == private_reply
+
+
 @pytest.mark.parametrize(
     ("text", "from_bot", "target_kind", "expected"),
     [
         ("签到", True, "group", "verified"),
         ("签到成功啦！", True, "group", "verified"),
+        ("今日签到成功，连续签到 12 天，获得 5 积分", True, "group", "verified"),
+        ("Check-in successful! You earned 5 points.", True, "group", "verified"),
         ("请回复 /qd 完成签到", True, "group", "verified"),
         ("@user /qd", False, "group", None),
         ("签到失败，请稍后重试", True, "group", "failed"),
@@ -304,6 +392,35 @@ def test_checkin_verification_accepts_flexible_bot_responses(
     assert _checkin_verification_status(
         text, from_bot=from_bot, target_kind=target_kind
     ) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["恭喜你获得 10 金币", "您已成功打卡，积分+5", "获得奖励 10", "签到已完成"],
+)
+def test_checkin_verification_accepts_reward_only_bot_confirmations(text: str) -> None:
+    assert _checkin_verification_status(text, from_bot=True, target_kind="group") == "verified"
+
+
+def test_checkin_verification_accepts_direct_reply_without_resolved_sender() -> None:
+    assert _checkin_verification_status(
+        "今日签到成功，获得 5 积分",
+        from_bot=False,
+        target_kind="group",
+        direct_reply=True,
+    ) == "verified"
+    assert _checkin_verification_status(
+        "签到成功",
+        from_bot=False,
+        target_kind="group",
+        direct_reply=False,
+    ) is None
+    assert _checkin_verification_status(
+        "签到成功",
+        from_bot=False,
+        target_kind="group",
+        direct_reply=True,
+    ) == "verified"
 
 
 @pytest.mark.asyncio
@@ -591,6 +708,16 @@ def test_checkin_failure_streak_increments_and_resets() -> None:
     assert recovered.failure_streak == 0
 
 
+def test_checkin_unverified_streak_increments_and_resets() -> None:
+    config = CheckinConfig()
+    now = dt.datetime.now(dt.timezone.utc)
+    pending = _append_checkin_record(config, "sent_unverified", "未收到回复", now)
+    pending = _append_checkin_record(pending, "sent_unverified", "未收到回复", now)
+    assert pending.unverified_streak == 2
+    recovered = _append_checkin_record(pending, "verified", "签到成功", now)
+    assert recovered.unverified_streak == 0
+
+
 @pytest.mark.asyncio
 async def test_checkin_suggestion_includes_source_bot_reply_and_ai_reason(monkeypatch) -> None:
     state: dict[str, str] = {}
@@ -731,7 +858,7 @@ async def test_checkin_suggestion_keeps_candidate_after_temporary_ai_failure(mon
 
 
 @pytest.mark.asyncio
-async def test_checkin_suggestion_defers_404_until_midnight(monkeypatch) -> None:
+async def test_checkin_suggestion_persists_404_after_bounded_backoff(monkeypatch) -> None:
     saved: list[DeferredCheckinSuggestion] = []
 
     class Archive:
@@ -760,22 +887,26 @@ async def test_checkin_suggestion_defers_404_until_midnight(monkeypatch) -> None
     }
     service._checkin_configs = lambda: {}
     service._checkin_suggestion_ignored = lambda *_args: False
-    service._checkin_ai_unavailable = lambda: asyncio.sleep(0, result=False)
+    async def available():
+        return False
+    service._checkin_ai_unavailable = available
     monkeypatch.setattr("tg_insight.service.CHECKIN_SUGGESTION_REPLY_WAIT_SECONDS", 0)
+    monkeypatch.setattr("tg_insight.service._checkin_suggestion_retry_delay", lambda _attempt: 0)
+    async def no_sleep(_delay):
+        return None
+    monkeypatch.setattr("tg_insight.service.asyncio.sleep", no_sleep)
 
     await service._analyze_checkin_suggestion((-1001, 7))
 
     assert (-1001, 7) not in service._checkin_suggestion_candidates
     assert len(saved) == 1
     assert saved[0].last_error == "model unavailable"
-    assert saved[0].retry_after.hour == 0
-    assert saved[0].retry_after.minute == 0
-    assert saved[0].retry_after.date() > dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+    assert saved[0].retry_count == 7
 
 
 @pytest.mark.asyncio
-async def test_deferred_checkin_suggestion_replays_when_due() -> None:
-    now = dt.datetime(2026, 8, 21, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+async def test_deferred_checkin_suggestion_replays_when_status_recovers() -> None:
+    now = dt.datetime.now(ZoneInfo("Asia/Shanghai"))
     saved = DeferredCheckinSuggestion(
         chat_id=-1001,
         message_id=7,
@@ -793,7 +924,7 @@ async def test_deferred_checkin_suggestion_replays_when_due() -> None:
     calls: list[tuple[tuple[int, int], bool, bool]] = []
 
     class Archive:
-        def due_deferred_checkin_suggestions(self, _now):
+        def deferred_checkin_suggestions(self):
             return [saved]
 
         def reschedule_deferred_checkin_suggestion(self, chat_id, message_id, retry_after):
@@ -811,12 +942,13 @@ async def test_deferred_checkin_suggestion_replays_when_due() -> None:
     service._checkin_suggestion_tasks = set()
     service._checkin_configs = lambda: {}
     service._checkin_suggestion_ignored = lambda *_args: False
+    service._checkin_ai_status_available = lambda: asyncio.sleep(0, result=True)
     service._analyze_checkin_suggestion = analyze
 
-    service._retry_deferred_checkin_suggestions(now)
+    await service._retry_deferred_checkin_suggestions(now)
     await asyncio.sleep(0)
 
-    assert rescheduled == [(-1001, 7, dt.datetime(2026, 8, 22, 0, 0, tzinfo=now.tzinfo))]
+    assert rescheduled == [(-1001, 7, now)]
     assert calls == [((-1001, 7), False, True)]
 
 
@@ -837,7 +969,7 @@ async def test_bot_command_menu_is_available_to_all_client_languages() -> None:
     assert requests[0].lang_code == ""
     assert [command.command for command in requests[0].commands] == [
         "groups", "recent", "ask", "summary", "content", "checkin", "alerts",
-        "topics", "refresh", "backup", "settings", "status", "help",
+            "topics", "refresh", "backup", "settings", "status", "retry", "help",
     ]
 
 
