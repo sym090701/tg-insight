@@ -155,3 +155,74 @@ The runtime image uses a pinned base digest and hash-locked Linux/Python 3.12
 dependencies. Regenerate and review both lock files before changing dependency
 versions. `.dockerignore` excludes the environment file, sessions, and archive from
 the Docker build context.
+
+## 中文说明
+
+`tg-insight` 是一个 Telegram 群组归档、每日摘要和基于历史消息问答工具。
+
+首次私聊 Bot 时，会先让你选择 `中文` 或 `English`。选择会保存到本地 SQLite
+状态中，并控制 Bot 菜单、通知、摘要、重大事件提醒、签到报告和 AI 查询结果。
+之后可以通过 `/settings` 随时切换语言；在选择语言前，后台主动通知会暂缓发送。
+
+### 功能
+
+- Telethon 用户会话发现已加入的群组；归档来源可以在配置文件中固定，也可以通过私聊 Bot 选择。
+- 消息保存在本地 SQLite 数据库中，并使用 FTS5 trigram 搜索。
+- `/ask` 查询历史，`/summary` 生成摘要，`/content` 管理成人内容排除，`/status` 查看状态。
+- 每日摘要只发送给 `TG_SUMMARY_TARGET`，按配置的 UTC+8（Asia/Shanghai）时间推送。
+- 摘要先跨群排序高信息量、影响大、紧急或可执行的内容，再分别列出各群情报。
+- 摘要使用精确时间戳和消息年龄；旧消息不会被当作新消息重复报告，只有同一话题近期出现真实进展时才作为上下文。
+- `/content` 自动或手动标记成人内容的群组不会进入摘要，但消息仍保存在归档中。
+- `LLM_FALLBACK_MODEL` 可在主模型临时连接、超时、限流或服务错误时提供备用模型。
+- `/checkin` 使用已授权的 Telegram 个人账号发送每日签到。每个目标有独立的 UTC+8 时间、文本和开关；新目标默认 00:30，并随机延后 300-800ms。
+- 签到验证会识别可信 Bot 的成功回复、明确的 `签到`/`打卡` 回复，以及 `/qd`/`/checkin` 命令；普通成员消息和自己的发送命令不会被当作成功凭据。
+- AI 临时不可用时，签到建议、重大事件、话题分析、内容分类和摘要任务会按退避策略重试，之后写入 SQLite，模型恢复后再统一重试。`/retry` 可手动触发重试。
+- `/alerts` 配置重大事件提醒，`/topics` 配置群组关键词订阅，`/backup` 导出 SQLite 备份到授权用户私聊。备份包含历史消息，应按敏感数据保护。
+- 发送给 LLM 前，API Key、Bot Token、哈希、邮箱、手机号和 IP 地址等会在模型副本中替换；本地记录和 Telegram 通知保留原始文本。
+- Telegram 内容均作为不可信数据处理，LLM 不能直接执行 Telegram 操作。归档大小、磁盘预留、摘要输入和自动重试均有硬限制。
+
+### 部署
+
+1. 将 `.env.example` 复制为 `.env`，填写所有必填配置。
+2. 创建持久化目录，并将所有者设为 `10001:10001`。
+3. 构建镜像，首次运行授权 Telegram 用户会话，然后启动服务。
+4. 和配置的 Bot 私聊一次，再通过 `/groups` 选择归档群组。只有 `TG_ALLOWED_USER_IDS` 中的用户 ID 可以使用管理功能。
+
+常用命令：`mkdir -p data`、`chown 10001:10001 data`、`docker compose build`、
+`docker compose run --rm tg-insight auth`、`docker compose up -d`。
+
+### 命令
+
+| 命令 | 作用 |
+| --- | --- |
+| `/groups` | 翻页选择或清除归档群组 |
+| `/recent [1-50]` | 读取指定群组最近的文字消息 |
+| `/ask <问题>` | 搜索历史并引用来源回答 |
+| `/summary` | 立即生成过去 24 小时摘要 |
+| `/settings` | 设置每日推送时间、开关和语言 |
+| `/content` | 管理群组内容分类并重新分析 |
+| `/checkin` | 管理自动签到目标、文本、时间、Topic 和历史 |
+| `/alerts` | 设置重大事件提醒和关键词 |
+| `/topics` | 设置群组关键词订阅 |
+| `/refresh` | 刷新群组和 Bot 目标 |
+| `/backup` | 导出 SQLite 归档备份到私聊 Bot |
+| `/status` | 查看归档、来源、计划和模型状态 |
+| `/retry` | 手动重试持久化的 AI 任务 |
+| `/help` | 查看帮助 |
+
+私聊 Bot 发送的普通文本会作为 `/ask` 查询。群组选择、最近消息读取、归档查询和摘要只能在私聊 Bot 中操作。
+
+签到目标和归档来源是独立配置：签到目标可以是已加入的 Telegram 群组，也可以是授权账号对话列表中的 Bot。
+通过 `/checkin` 设置完整文本，例如群组中的 `@example_bot /checkin` 或 Bot 私聊中的 `/checkin`。
+文本由已授权的 Telegram 用户账号直接发送，不会发送给配置的 LLM 服务商。
+
+### 资源限制
+
+默认最多保留两年消息、1000 万条记录和 10 GiB SQLite 数据，同时至少保留 1 GiB 可用磁盘空间。
+单次摘要最多使用 500 条消息和 120,000 个序列化字符；失败的定时摘要最多按退避策略重试三次。
+
+### 安全
+
+Telethon 会话文件拥有 Telegram 账号访问权限。请严格限制 `data/` 和 `.env` 的权限，并优先使用只加入必要群组的专用账号。
+聊天记录会发送给配置的 LLM 服务商用于摘要和问答，请选择符合群组隐私和留存要求的服务商。自定义 LLM 地址必须使用 HTTPS。
+运行镜像使用固定摘要的基础镜像并锁定依赖哈希；`.dockerignore` 会排除环境文件、会话文件和归档数据。
